@@ -1,0 +1,20 @@
+{
+  "name": "ua8295",
+  "version": "1.0.0",
+  "description": "Experimental CPU-level emulator tooling for the Philips UA-8295 / Nokia DA-8520 Short-Burst Message Terminal firmware.",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc && vite build",
+    "test": "vitest run"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "devDependencies": {
+    "typescript": "^6.0.3",
+    "vite": "^8.0.11",
+    "vitest": "^4.1.5"
+  }
+}

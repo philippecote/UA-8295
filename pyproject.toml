@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ua8295-emulator"
+version = "0.1.0"
+description = "Experimental CPU-level emulator tooling for the Philips UA-8295 / Nokia DA-8520."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "ua8295 emulator contributors" }]
+
+[project.scripts]
+ua8295-emulator = "ua8295_emulator.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["ua8295_emulator*"]
