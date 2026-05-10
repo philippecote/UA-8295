@@ -1,9 +1,11 @@
+import { UA8295Hardware } from "./devices";
 import { ExternalBus } from "./memory";
 import { MCS51, type CpuTraceOptions, type TraceEntry } from "./mcs51";
 import { mainCode, type RomSet } from "./roms";
 import { TraceLog, type CpuName } from "./trace";
 
 export const MAIN_XRAM_SIZE = 0x2000;
+export const MAIN_XRAM_BASE = 0x6000;
 export const IOP_XRAM_SIZE = 0x0800;
 export const TEXT_ROM_BASE = 0x8000;
 
@@ -24,6 +26,7 @@ export class UA8295Machine {
   readonly iopCpu: MCS51;
   readonly traceLog: TraceLog;
   readonly traceOptions: Required<CpuTraceOptions>;
+  readonly hardware: UA8295Hardware;
   private schedulerSlices = 0;
 
   constructor(
@@ -37,13 +40,16 @@ export class UA8295Machine {
       traceSfrWrites: true,
       ...options.cpuTrace
     };
+    this.hardware = new UA8295Hardware();
     this.mainBus = new ExternalBus(mainCode(roms), {
+      xramBase: MAIN_XRAM_BASE,
       xramSize: MAIN_XRAM_SIZE,
       textRom: roms.text.data
     });
     this.iopBus = new ExternalBus(roms.iop.data, { xramSize: IOP_XRAM_SIZE });
-    this.mainCpu = new MCS51(this.mainBus, "main", this.traceLog, this.traceOptions);
-    this.iopCpu = new MCS51(this.iopBus, "iop", this.traceLog, this.traceOptions);
+    this.mainCpu = new MCS51(this.mainBus, "main", this.traceLog, this.traceOptions, this.hardware);
+    this.iopCpu = new MCS51(this.iopBus, "iop", this.traceLog, this.traceOptions, this.hardware);
+    this.hardware.connectSerialEndpoints(this.mainCpu, this.iopCpu);
   }
 
   cpu(name: CpuName): MCS51 {
@@ -53,6 +59,7 @@ export class UA8295Machine {
   reset(): void {
     this.mainCpu.reset();
     this.iopCpu.reset();
+    this.hardware.keyboard.clear();
     this.traceLog.clear();
     this.schedulerSlices = 0;
   }
@@ -87,7 +94,7 @@ export class UA8295Machine {
     return [
       "main code 0x0000-0x1FFF: IC24 lower firmware EPROM",
       "main code 0x2000-0x3FFF: IC18 upper firmware EPROM",
-      `main xdata 0x0000-0x${(MAIN_XRAM_SIZE - 1).toString(16).toUpperCase().padStart(4, "0")}: emulated SRAM`,
+      `main xdata 0x${MAIN_XRAM_BASE.toString(16).toUpperCase()}-0x${(MAIN_XRAM_BASE + MAIN_XRAM_SIZE - 1).toString(16).toUpperCase()}: emulated SRAM`,
       `main xdata 0x${TEXT_ROM_BASE.toString(16).toUpperCase()}-0x${(TEXT_ROM_BASE + this.roms.text.data.length - 1).toString(16).toUpperCase()}: IC15 text ROM`,
       "main xdata other addresses: traceable keyboard/display/serial/radio stubs",
       "iop code 0x0000-0x1FFF: IC03 I/O processor firmware EPROM",

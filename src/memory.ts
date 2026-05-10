@@ -15,15 +15,17 @@ export class ExternalBus {
   readonly xram: Uint8Array;
   readonly textRom: Uint8Array;
   readonly ioEvents: string[] = [];
+  private readonly xramBase: number;
 
   constructor(
     code: Uint8Array,
-    options: { xramSize?: number; defaultRead?: number; textRom?: Uint8Array } = {}
+    options: { xramBase?: number; xramSize?: number; defaultRead?: number; textRom?: Uint8Array } = {}
   ) {
     const xramSize = options.xramSize ?? 0x10000;
     if (xramSize <= 0 || xramSize > 0x10000) {
       throw new Error("xramSize must be between 1 and 65536");
     }
+    this.xramBase = options.xramBase ?? 0;
     this.codeMem = fit64k(code);
     this.xram = new Uint8Array(xramSize);
     this.textRom = options.textRom ?? new Uint8Array();
@@ -38,8 +40,9 @@ export class ExternalBus {
 
   readXdata(addr: number): number {
     const masked = addr & 0xffff;
-    if (masked < this.xram.length) {
-      return this.xram[masked];
+    const xramOffset = masked - this.xramBase;
+    if (xramOffset >= 0 && xramOffset < this.xram.length) {
+      return this.xram[xramOffset];
     }
     const textAddr = masked - 0x8000;
     if (textAddr >= 0 && textAddr < this.textRom.length) {
@@ -51,7 +54,8 @@ export class ExternalBus {
 
   regionForXdata(addr: number): XdataRegion {
     const masked = addr & 0xffff;
-    if (masked < this.xram.length) {
+    const xramOffset = masked - this.xramBase;
+    if (xramOffset >= 0 && xramOffset < this.xram.length) {
       return "xram";
     }
     const textAddr = masked - 0x8000;
@@ -64,8 +68,9 @@ export class ExternalBus {
   writeXdata(addr: number, value: number): void {
     const masked = addr & 0xffff;
     const byte = value & 0xff;
-    if (masked < this.xram.length) {
-      this.xram[masked] = byte;
+    const xramOffset = masked - this.xramBase;
+    if (xramOffset >= 0 && xramOffset < this.xram.length) {
+      this.xram[xramOffset] = byte;
       return;
     }
     this.ioEvents.push(`write_xdata 0x${hex(masked, 4)} <- 0x${hex(byte, 2)}`);

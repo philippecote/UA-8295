@@ -1,12 +1,12 @@
 # UA-8295 Emulator
 
-Experimental CPU-level emulator tooling for the Philips UA-8295 / Nokia DA-8520
+Browser-native emulator tooling for the Philips UA-8295 / Nokia DA-8520
 Short-Burst Message Terminal firmware.
 
-The first milestone is a traceable Intel 80C31/8051 emulator rather than a
-complete interactive front panel. It can validate the public EPROM set, load the
-main CPU and I/O processor ROMs, execute instructions, and report CPU/RAM/SFR
-state for reverse engineering.
+The TypeScript implementation is the product: it validates the public EPROM set,
+executes the main CPU and I/O processor ROMs, models emerging front-panel
+hardware behavior, and provides headless integration tests for ROM-backed device
+workflows.
 
 ## Firmware
 
@@ -20,23 +20,17 @@ Place the public Crypto Museum firmware files in `Nokia_DA8520_firmware/`:
 ## Usage
 
 ```sh
-python -m ua8295_emulator --rom-dir Nokia_DA8520_firmware --steps 1000 --trace
-```
-
-Run the I/O processor firmware instead of the main CPU:
-
-```sh
-python -m ua8295_emulator --rom-dir Nokia_DA8520_firmware --cpu iop --steps 1000
-```
-
-Validate ROMs without executing firmware:
-
-```sh
-python -m ua8295_emulator --rom-dir Nokia_DA8520_firmware --validate-only
+npm run dev
 ```
 
 ## Tests
 
 ```sh
-python -m unittest discover
+npm test
+npm run build
 ```
+
+The TypeScript tests include headless device integration coverage: they load the
+real ROMs, run the coupled main and I/O processor CPUs through initial check-out,
+press front-panel keys through the hardware model, and assert the observed
+32-character display text without using a browser.

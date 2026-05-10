@@ -107,6 +107,29 @@ h1 {
   min-height: 2.4rem;
 }
 
+.keyboard button:active {
+  background: #50648f;
+}
+
+.keyboard-status {
+  color: #9dadc9;
+  font-family: "SFMono-Regular", Consolas, monospace;
+  font-size: 0.85rem;
+  margin-top: 0.75rem;
+  min-height: 1.2rem;
+}
+
+.display-details {
+  border-top: 1px solid #3a465d;
+  color: #b7c4dd;
+  font-family: "SFMono-Regular", Consolas, monospace;
+  font-size: 0.72rem;
+  line-height: 1.45;
+  margin-top: 0.75rem;
+  overflow-wrap: anywhere;
+  padding-top: 0.75rem;
+}
+
 .controls {
   align-items: center;
   display: flex;

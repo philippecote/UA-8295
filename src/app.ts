@@ -1,4 +1,5 @@
 import "./styles.css";
+import { FRONT_PANEL_KEYS, type FrontPanelKey } from "./devices";
 import { hex } from "./memory";
 import { formatTrace, type TraceEntry } from "./mcs51";
 import { loadBundledRomSet, loadRomSetFromFiles, ROM_SPECS, type RomSet } from "./roms";
@@ -13,6 +14,7 @@ const state: {
   ioCpuFilter: CpuName | "device" | "all";
   ioKindFilter: TraceEventKind | "all";
   traceAllXdata: boolean;
+  continuousRun: boolean;
   status: string;
 } = {
   roms: null,
@@ -22,6 +24,7 @@ const state: {
   ioCpuFilter: "all",
   ioKindFilter: "all",
   traceAllXdata: false,
+  continuousRun: false,
   status: "Load ROMs to start."
 };
 
@@ -30,12 +33,14 @@ if (!appElement) {
   throw new Error("Missing #app root");
 }
 const app = appElement;
+let animationHandle: number | null = null;
 
 render();
 
 function render(): void {
   const cpu = state.machine?.cpu(state.activeCpu);
   const snapshot = cpu?.snapshot();
+  const displayText = state.machine?.hardware.display.displayLine();
   const ioEvents = state.machine?.traceLog.recent(300, {
     cpu: state.ioCpuFilter,
     kind: state.ioKindFilter
@@ -56,8 +61,10 @@ function render(): void {
         <p>This is the browser-native TypeScript port of the 80C31 emulator. It executes the public EPROM images locally and exposes CPU state while the device peripherals are reverse engineered.</p>
       </div>
       <div class="device">
-        <div class="display">${displayLine(snapshot)}</div>
+        <div class="display">${displayText ?? displayLine(snapshot)}</div>
         <div class="keyboard">${renderKeys()}</div>
+        <div class="keyboard-status">${state.machine?.hardware.keyboard.describe() ?? "Keyboard inactive"}</div>
+        <div class="display-details">${renderDisplayDetails()}</div>
       </div>
     </section>
 
@@ -76,6 +83,8 @@ function render(): void {
       <button data-action="run-1000" ${state.machine ? "" : "disabled"}>Run 1,000</button>
       <button data-action="run-10000" ${state.machine ? "" : "disabled"}>Run 10,000</button>
       <button data-action="run-both-1000" ${state.machine ? "" : "disabled"}>Run Both 1,000</button>
+      <button data-action="run-frame" ${state.machine ? "" : "disabled"}>Run Frame</button>
+      <button data-action="continuous" ${state.machine ? "" : "disabled"}>${state.continuousRun ? "Pause" : "Run Continuous"}</button>
       <label class="checkbox">
         <input data-action="trace-all-xdata" type="checkbox" ${state.traceAllXdata ? "checked" : ""} />
         Trace SRAM/text ROM MOVX
@@ -163,6 +172,8 @@ function render(): void {
   app.querySelector('[data-action="run-1000"]')?.addEventListener("click", () => runSteps(1000));
   app.querySelector('[data-action="run-10000"]')?.addEventListener("click", () => runSteps(10000));
   app.querySelector('[data-action="run-both-1000"]')?.addEventListener("click", () => runBoth(1000));
+  app.querySelector('[data-action="run-frame"]')?.addEventListener("click", () => runFrame());
+  app.querySelector('[data-action="continuous"]')?.addEventListener("click", toggleContinuousRun);
   app.querySelector<HTMLInputElement>('[data-action="trace-all-xdata"]')?.addEventListener("change", (event: Event) => {
     const input = event.currentTarget;
     if (!(input instanceof HTMLInputElement)) return;
@@ -183,6 +194,17 @@ function render(): void {
     render();
   });
   app.querySelector('[data-action="clear-io"]')?.addEventListener("click", clearIoTrace);
+  app.querySelectorAll<HTMLButtonElement>("[data-key]").forEach((button) => {
+    const key = button.dataset.key as FrontPanelKey | undefined;
+    if (!key) return;
+    button.addEventListener("pointerdown", () => setKey(key, true));
+    button.addEventListener("pointerup", () => setKey(key, false));
+    button.addEventListener("pointerleave", () => setKey(key, false));
+    button.addEventListener("keydown", (event) => {
+      if (event.key === " " || event.key === "Enter") setKey(key, true);
+    });
+    button.addEventListener("keyup", () => setKey(key, false));
+  });
 }
 
 async function loadBundled(): Promise<void> {
@@ -208,6 +230,7 @@ async function loadFiles(files: FileList): Promise<void> {
 }
 
 function installMachine(roms: RomSet, status: string): void {
+  stopContinuousRun();
   state.roms = roms;
   state.machine = new UA8295Machine(roms, {
     cpuTrace: {
@@ -222,6 +245,7 @@ function installMachine(roms: RomSet, status: string): void {
 function resetActive(): void {
   state.machine?.cpu(state.activeCpu).reset();
   state.trace = [];
+  stopContinuousRun();
   state.status = `${state.activeCpu} CPU reset.`;
   render();
 }
@@ -230,7 +254,7 @@ function runSteps(steps: number): void {
   const machine = state.machine;
   if (!machine) return;
   try {
-    state.trace.push(...machine.runCpu(state.activeCpu, steps, true));
+    appendInstructionTrace(machine.runCpu(state.activeCpu, steps, true));
     state.status = `Ran ${steps.toLocaleString()} ${state.activeCpu} CPU instructions.`;
   } catch (error) {
     state.status = `CPU stopped: ${error instanceof Error ? error.message : String(error)}`;
@@ -243,7 +267,7 @@ function runBoth(steps: number): void {
   if (!machine) return;
   try {
     const result = machine.runScheduler(steps, 1, true);
-    state.trace.push(...result.main, ...result.iop);
+    appendInstructionTrace([...result.main, ...result.iop]);
     state.status = `Ran ${steps.toLocaleString()} scheduler slices across both CPUs.`;
   } catch (error) {
     state.status = `CPU stopped: ${error instanceof Error ? error.message : String(error)}`;
@@ -251,9 +275,67 @@ function runBoth(steps: number): void {
   render();
 }
 
+function runFrame(): void {
+  const machine = state.machine;
+  if (!machine) return;
+  try {
+    const result = machine.runScheduler(60, 4, true);
+    appendInstructionTrace([...result.main, ...result.iop]);
+    state.status = "Ran one scheduler frame.";
+  } catch (error) {
+    stopContinuousRun();
+    state.status = `CPU stopped: ${error instanceof Error ? error.message : String(error)}`;
+  }
+  render();
+}
+
+function toggleContinuousRun(): void {
+  if (state.continuousRun) {
+    stopContinuousRun();
+    state.status = "Continuous run paused.";
+    render();
+    return;
+  }
+  state.continuousRun = true;
+  state.status = "Continuous run active.";
+  scheduleContinuousRun();
+  render();
+}
+
+function scheduleContinuousRun(): void {
+  if (!state.continuousRun) return;
+  animationHandle = requestAnimationFrame(() => {
+    runFrame();
+    scheduleContinuousRun();
+  });
+}
+
+function stopContinuousRun(): void {
+  state.continuousRun = false;
+  if (animationHandle !== null) {
+    cancelAnimationFrame(animationHandle);
+    animationHandle = null;
+  }
+}
+
+function appendInstructionTrace(entries: TraceEntry[]): void {
+  state.trace.push(...entries);
+  if (state.trace.length > 2_000) {
+    state.trace.splice(0, state.trace.length - 2_000);
+  }
+}
+
 function clearIoTrace(): void {
   state.machine?.traceLog.clear();
   state.status = "Cleared I/O trace.";
+  render();
+}
+
+function setKey(key: FrontPanelKey, isPressed: boolean): void {
+  const machine = state.machine;
+  if (!machine) return;
+  machine.hardware.keyboard.setPressed(key, isPressed);
+  state.status = isPressed ? `Pressed ${key}.` : `Released ${key}.`;
   render();
 }
 
@@ -277,8 +359,12 @@ function displayLine(snapshot: ReturnType<UA8295Machine["mainCpu"]["snapshot"]> 
 }
 
 function renderKeys(): string {
-  const keys = ["^", "CONF", "KEY", "TIME", "ENCR", "SEND", "RCV", "DEL", "0", "1", "2", "3", "4", "5", "6", "7"];
-  return keys.map((key) => `<button disabled>${key}</button>`).join("");
+  return FRONT_PANEL_KEYS.map((key) => `<button data-key="${key}" ${state.machine ? "" : "disabled"}>${key}</button>`).join("");
+}
+
+function renderDisplayDetails(): string {
+  const lines = state.machine?.hardware.display.detailLines() ?? ["Display inactive"];
+  return lines.map((line) => `<div>${line}</div>`).join("");
 }
 
 function renderOption(value: string, label: string, selected: string): string {

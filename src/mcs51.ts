@@ -25,6 +25,15 @@ export interface CpuSnapshot {
   cycles: number;
 }
 
+type InterruptSource = "EX0" | "T0" | "EX1" | "T1" | "SERIAL";
+
+interface PendingInterrupt {
+  source: InterruptSource;
+  vector: number;
+  priority: "low" | "high";
+  flag?: { sfr: number; mask: number };
+}
+
 const SFR_NAMES = new Map<number, string>([
   [0x80, "P0"],
   [0x81, "SP"],
@@ -72,6 +81,14 @@ export interface CpuTraceOptions {
   traceAllXdata?: boolean;
   traceSfrReads?: boolean;
   traceSfrWrites?: boolean;
+}
+
+export interface CpuHardwareHooks {
+  readSfr?(cpu: CpuName, address: number, latchValue: number): number;
+  writeSfr?(cpu: CpuName, address: number, value: number, previous: number): void;
+  transmitSerial?(cpu: CpuName, value: number, tb8: boolean): void;
+  readXdata?(cpu: CpuName, address: number, busValue: number, region: XdataRegion): number;
+  writeXdata?(cpu: CpuName, address: number, value: number, region: XdataRegion): void;
 }
 
 export function u8(value: number): number {
@@ -140,6 +157,39 @@ export function instructionLength(opcode: number): number {
   return 1;
 }
 
+export function instructionCycles(opcode: number): number {
+  if (opcode === 0x84 || opcode === 0xa4) return 4;
+  if (
+    opcode === 0x02 ||
+    opcode === 0x12 ||
+    opcode === 0x22 ||
+    opcode === 0x32 ||
+    opcode === 0x73 ||
+    opcode === 0x83 ||
+    opcode === 0x90 ||
+    opcode === 0x93 ||
+    opcode === 0xa3 ||
+    opcode === 0xc0 ||
+    opcode === 0xd0 ||
+    opcode === 0xe0 ||
+    opcode === 0xf0 ||
+    isAjmp(opcode) ||
+    isAcall(opcode) ||
+    (opcode >= 0xb4 && opcode <= 0xbf) ||
+    (opcode >= 0xd5 && opcode <= 0xdf) ||
+    opcode === 0xe2 ||
+    opcode === 0xe3 ||
+    opcode === 0xf2 ||
+    opcode === 0xf3
+  ) {
+    return 2;
+  }
+  if (instructionLength(opcode) >= 2 && (opcode <= 0x7f || opcode >= 0x85)) {
+    return 2;
+  }
+  return 1;
+}
+
 export class MCS51 {
   pc = 0;
   readonly iram = new Uint8Array(128);
@@ -148,12 +198,14 @@ export class MCS51 {
   cycles = 0;
   private activeInstructionPc: number | null = null;
   private activeOpcode = 0;
+  private interruptInService: "low" | "high" | null = null;
 
   constructor(
     readonly bus: ExternalBus,
     readonly name = "cpu",
     readonly traceLog: TraceLog | null = null,
-    readonly traceOptions: CpuTraceOptions = {}
+    readonly traceOptions: CpuTraceOptions = {},
+    readonly hardware: CpuHardwareHooks | null = null
   ) {
     this.reset();
   }
@@ -189,6 +241,7 @@ export class MCS51 {
     }
     this.halted = false;
     this.cycles = 0;
+    this.interruptInService = null;
     this.updateParity();
   }
 
@@ -235,7 +288,8 @@ export class MCS51 {
     if (masked < 0x80) {
       return this.iram[masked];
     }
-    const value = this.sfr.get(masked) ?? 0;
+    const latchValue = this.sfr.get(masked) ?? 0;
+    const value = this.hardware?.readSfr?.(this.traceCpuName(), masked, latchValue) ?? latchValue;
     this.recordSfrAccess("read", masked, value);
     return value;
   }
@@ -249,10 +303,24 @@ export class MCS51 {
     } else {
       this.sfr.set(masked, byte);
     }
+    if (masked >= 0x80) {
+      this.hardware?.writeSfr?.(this.traceCpuName(), masked, byte, previous);
+    }
     this.recordSfrAccess("write", masked, byte, previous);
     if (masked === 0xe0) {
       this.updateParity();
     }
+    if (masked === 0x99) {
+      const scon = this.sfr.get(0x98) ?? 0;
+      this.sfr.set(0x98, scon | 0x02);
+      this.hardware?.transmitSerial?.(this.traceCpuName(), byte, (scon & 0x08) !== 0);
+    }
+  }
+
+  receiveSerial(value: number, rb8 = false): void {
+    const scon = this.sfr.get(0x98) ?? 0;
+    this.sfr.set(0x99, value & 0xff);
+    this.sfr.set(0x98, (scon | 0x01 | (rb8 ? 0x04 : 0)) & (rb8 ? 0xff : 0xfb));
   }
 
   step(): TraceEntry {
@@ -314,6 +382,10 @@ export class MCS51 {
       text = `${opcode === 0x20 ? "JB" : "JNB"} ${fmtBit(bit)}, ${signed(off)}`;
     } else if (opcode === 0x22 || opcode === 0x32) {
       this.ret();
+      if (opcode === 0x32) {
+        this.recordInterruptReturn(startPc);
+        this.interruptInService = null;
+      }
       text = opcode === 0x22 ? "RET" : "RETI";
     } else if (opcode === 0x23) {
       this.a = (this.a << 1) | (this.a >> 7);
@@ -461,7 +533,10 @@ export class MCS51 {
       throw new CpuError(`unsupported opcode 0x${hex(opcode, 2)} at 0x${hex(startPc, 4)}`);
     }
 
-    this.cycles += 1;
+    const elapsedCycles = instructionCycles(opcode);
+    this.cycles += elapsedCycles;
+    this.advanceTimers(elapsedCycles, startPc);
+    this.dispatchInterruptIfPending(startPc);
     this.updateParity();
     const bytes = Array.from({ length: instructionLength(opcode) }, (_, i) => this.bus.readCode(startPc + i));
     this.activeInstructionPc = null;
@@ -525,6 +600,171 @@ export class MCS51 {
 
   private traceCpuName(): CpuName {
     return this.name === "iop" ? "iop" : "main";
+  }
+
+  private advanceTimers(elapsedCycles: number, pc: number): void {
+    this.advanceTimer(0, elapsedCycles, pc);
+    this.advanceTimer(1, elapsedCycles, pc);
+  }
+
+  private advanceTimer(timer: 0 | 1, elapsedCycles: number, pc: number): void {
+    const tcon = this.sfr.get(0x88) ?? 0;
+    const tmod = this.sfr.get(0x89) ?? 0;
+    const running = timer === 0 ? (tcon & 0x10) !== 0 : (tcon & 0x40) !== 0;
+    if (!running) return;
+
+    const shift = timer === 0 ? 0 : 4;
+    const mode = (tmod >> shift) & 0x03;
+    const counterMode = (tmod & (timer === 0 ? 0x04 : 0x40)) !== 0;
+    if (counterMode) return;
+
+    if (timer === 0 && mode === 3) {
+      this.advanceSplitTimer0(elapsedCycles, pc);
+      return;
+    }
+    if (timer === 1 && ((tmod & 0x03) === 3)) {
+      return;
+    }
+
+    const tlAddr = timer === 0 ? 0x8a : 0x8b;
+    const thAddr = timer === 0 ? 0x8c : 0x8d;
+    const flagMask = timer === 0 ? 0x20 : 0x80;
+
+    if (mode === 0) {
+      let counter = (((this.sfr.get(thAddr) ?? 0) << 5) | ((this.sfr.get(tlAddr) ?? 0) & 0x1f)) + elapsedCycles;
+      if (counter > 0x1fff) {
+        counter &= 0x1fff;
+        this.setSfrBit(0x88, flagMask, true);
+        this.recordTimerOverflow(timer, pc, counter);
+      }
+      this.sfr.set(tlAddr, counter & 0x1f);
+      this.sfr.set(thAddr, (counter >> 5) & 0xff);
+      return;
+    }
+
+    if (mode === 2) {
+      let value = (this.sfr.get(tlAddr) ?? 0) + elapsedCycles;
+      while (value > 0xff) {
+        value = (this.sfr.get(thAddr) ?? 0) + (value - 0x100);
+        this.setSfrBit(0x88, flagMask, true);
+        this.recordTimerOverflow(timer, pc, value & 0xff);
+      }
+      this.sfr.set(tlAddr, value & 0xff);
+      return;
+    }
+
+    let counter = (((this.sfr.get(thAddr) ?? 0) << 8) | (this.sfr.get(tlAddr) ?? 0)) + elapsedCycles;
+    if (counter > 0xffff) {
+      counter &= 0xffff;
+      this.setSfrBit(0x88, flagMask, true);
+      this.recordTimerOverflow(timer, pc, counter);
+    }
+    this.sfr.set(tlAddr, counter & 0xff);
+    this.sfr.set(thAddr, (counter >> 8) & 0xff);
+  }
+
+  private advanceSplitTimer0(elapsedCycles: number, pc: number): void {
+    let low = (this.sfr.get(0x8a) ?? 0) + elapsedCycles;
+    if (low > 0xff) {
+      low &= 0xff;
+      this.setSfrBit(0x88, 0x20, true);
+      this.recordTimerOverflow(0, pc, low);
+    }
+    this.sfr.set(0x8a, low);
+
+    if ((this.sfr.get(0x88) ?? 0) & 0x40) {
+      let high = (this.sfr.get(0x8c) ?? 0) + elapsedCycles;
+      if (high > 0xff) {
+        high &= 0xff;
+        this.setSfrBit(0x88, 0x80, true);
+        this.recordTimerOverflow(1, pc, high);
+      }
+      this.sfr.set(0x8c, high);
+    }
+  }
+
+  private dispatchInterruptIfPending(pc: number): void {
+    const pending = this.pendingInterrupt();
+    if (!pending) return;
+    if (this.interruptInService === "high") return;
+    if (this.interruptInService === "low" && pending.priority === "low") return;
+
+    if (pending.flag) {
+      this.setSfrBit(pending.flag.sfr, pending.flag.mask, false);
+    }
+    this.push(this.pc & 0xff);
+    this.push(this.pc >> 8);
+    this.pc = pending.vector;
+    this.interruptInService = pending.priority;
+    this.traceLog?.record({
+      kind: "interrupt",
+      cpu: this.traceCpuName(),
+      pc,
+      cycle: this.cycles,
+      operation: "dispatch",
+      vector: pending.vector,
+      priority: pending.priority,
+      instruction: pending.source
+    });
+  }
+
+  private pendingInterrupt(): PendingInterrupt | null {
+    const ie = this.sfr.get(0xa8) ?? 0;
+    if ((ie & 0x80) === 0) return null;
+
+    const tcon = this.sfr.get(0x88) ?? 0;
+    const scon = this.sfr.get(0x98) ?? 0;
+    const candidates: PendingInterrupt[] = [];
+    if ((ie & 0x01) && (tcon & 0x02)) candidates.push(this.interruptCandidate("EX0", 0x0003, 0, { sfr: 0x88, mask: 0x02 }));
+    if ((ie & 0x02) && (tcon & 0x20)) candidates.push(this.interruptCandidate("T0", 0x000b, 1, { sfr: 0x88, mask: 0x20 }));
+    if ((ie & 0x04) && (tcon & 0x08)) candidates.push(this.interruptCandidate("EX1", 0x0013, 2, { sfr: 0x88, mask: 0x08 }));
+    if ((ie & 0x08) && (tcon & 0x80)) candidates.push(this.interruptCandidate("T1", 0x001b, 3, { sfr: 0x88, mask: 0x80 }));
+    if ((ie & 0x10) && (scon & 0x03)) candidates.push(this.interruptCandidate("SERIAL", 0x0023, 4));
+
+    return candidates.find((candidate) => candidate.priority === "high") ?? candidates[0] ?? null;
+  }
+
+  private interruptCandidate(
+    source: InterruptSource,
+    vector: number,
+    priorityBit: number,
+    flag?: { sfr: number; mask: number }
+  ): PendingInterrupt {
+    const ip = this.sfr.get(0xb8) ?? 0;
+    return {
+      source,
+      vector,
+      priority: (ip & (1 << priorityBit)) !== 0 ? "high" : "low",
+      flag
+    };
+  }
+
+  private recordTimerOverflow(timer: 0 | 1, pc: number, value: number): void {
+    this.traceLog?.record({
+      kind: "timer",
+      cpu: this.traceCpuName(),
+      pc,
+      cycle: this.cycles,
+      operation: "tick",
+      timer: timer === 0 ? "T0" : "T1",
+      value
+    });
+  }
+
+  private recordInterruptReturn(pc: number): void {
+    this.traceLog?.record({
+      kind: "interrupt",
+      cpu: this.traceCpuName(),
+      pc,
+      cycle: this.cycles,
+      operation: "return",
+      vector: pc
+    });
+  }
+
+  private setSfrBit(addr: number, mask: number, enabled: boolean): void {
+    const value = this.sfr.get(addr) ?? 0;
+    this.sfr.set(addr, enabled ? value | mask : value & ~mask);
   }
 
   private fetchByte(): number {
@@ -747,7 +987,8 @@ export class MCS51 {
   private movToA(opcode: number, direct: () => number): string {
     if (opcode === 0xe0) {
       const address = this.dptr;
-      const value = this.bus.readXdata(address);
+      const busValue = this.bus.readXdata(address);
+      const value = this.hardware?.readXdata?.(this.traceCpuName(), address, busValue, this.bus.regionForXdata(address) as XdataRegion) ?? busValue;
       this.recordMovxAccess("read", "@DPTR", address, value);
       this.a = value;
       return "MOVX A, @DPTR";
@@ -755,7 +996,8 @@ export class MCS51 {
     if (opcode === 0xe2 || opcode === 0xe3) {
       const reg = opcode & 1;
       const address = ((this.readDirect(0xa0) & 0xff) << 8) | this.getR(reg);
-      const value = this.bus.readXdata(address);
+      const busValue = this.bus.readXdata(address);
+      const value = this.hardware?.readXdata?.(this.traceCpuName(), address, busValue, this.bus.regionForXdata(address) as XdataRegion) ?? busValue;
       this.recordMovxAccess("read", reg === 0 ? "@R0" : "@R1", address, value);
       this.a = value;
       return `MOVX A, @R${reg}`;
@@ -784,6 +1026,7 @@ export class MCS51 {
       const address = this.dptr;
       const value = this.a;
       this.bus.writeXdata(address, value);
+      this.hardware?.writeXdata?.(this.traceCpuName(), address, value, this.bus.regionForXdata(address) as XdataRegion);
       this.recordMovxAccess("write", "@DPTR", address, value);
       return "MOVX @DPTR, A";
     }
@@ -792,6 +1035,7 @@ export class MCS51 {
       const address = ((this.readDirect(0xa0) & 0xff) << 8) | this.getR(reg);
       const value = this.a;
       this.bus.writeXdata(address, value);
+      this.hardware?.writeXdata?.(this.traceCpuName(), address, value, this.bus.regionForXdata(address) as XdataRegion);
       this.recordMovxAccess("write", reg === 0 ? "@R0" : "@R1", address, value);
       return `MOVX @R${reg}, A`;
     }
