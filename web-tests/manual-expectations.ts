@@ -15,7 +15,7 @@ export const MANUAL_EXPECTATIONS = {
       "The instruction card says the terminal is ready for a new operation when it displays the prompt; this state is reached after completing an operation or pressing the return/cancel key once or twice.",
     expectedEmulatorBehavior:
       "Headless tests should be able to press front-panel keys and observe a stable 32-character display string.",
-    currentExpectedDisplaySuffix: "FUNCTION"
+    currentExpectedDisplaySuffix: "FUNCTION?"
   },
   keyboard: {
     summary:

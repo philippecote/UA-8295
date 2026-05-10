@@ -43,16 +43,18 @@ export class KeyboardDevice {
     this.rowLatch = value & 0xff;
   }
 
-  readP3(latchValue: number): number {
+  readP3(latchValue: number, options: { forceReadyLow?: boolean } = {}): number {
     let value = latchValue & 0xff;
-    // The main firmware expects this ready/self-test input low before it continues.
-    value &= ~0x20;
+    if (options.forceReadyLow) {
+      // The main firmware expects this ready/self-test input low before it continues.
+      value &= ~0x20;
+    }
 
-    const selectedRow = this.selectedRow();
+    const selectedRows = this.selectedRows();
     for (const key of this.pressed) {
       const position = this.keyPositions.get(key);
       if (!position) continue;
-      if (selectedRow === null || selectedRow === position.row) {
+      if (selectedRows === null || selectedRows.includes(position.row)) {
         value &= ~this.columnMask(position.column);
       }
     }
@@ -65,15 +67,17 @@ export class KeyboardDevice {
 
   describe(): string {
     const keys = this.pressedKeys();
-    const row = this.selectedRow();
-    return keys.length ? `ROW ${row ?? "*"} KEY ${keys.join("+")}` : `ROW ${row ?? "*"} LATCH ${hex(this.rowLatch, 2)}`;
+    const rows = this.selectedRows();
+    const row = rows ? rows.join(",") : "*";
+    return keys.length ? `ROW ${row} KEY ${keys.join("+")}` : `ROW ${row} LATCH ${hex(this.rowLatch, 2)}`;
   }
 
-  private selectedRow(): number | null {
+  private selectedRows(): number[] | null {
+    const rows: number[] = [];
     for (let row = 0; row < 4; row += 1) {
-      if ((this.rowLatch & (1 << row)) === 0) return row;
+      if ((this.rowLatch & (1 << row)) === 0) rows.push(row);
     }
-    return null;
+    return rows.length > 0 ? rows : null;
   }
 
   private columnMask(column: number): number {
@@ -185,14 +189,14 @@ export class UA8295Hardware implements CpuHardwareHooks {
   }
 
   readSfr(cpu: CpuName, address: number, latchValue: number): number {
-    if (cpu === "main" && address === 0xb0) {
-      return this.keyboard.readP3(latchValue);
+    if (address === 0xb0) {
+      return this.keyboard.readP3(latchValue, { forceReadyLow: cpu === "main" });
     }
     return latchValue;
   }
 
   writeSfr(cpu: CpuName, address: number, value: number): void {
-    if (cpu === "main" && address === 0x90) {
+    if (address === 0x90) {
       this.keyboard.setRowLatch(value);
     }
   }

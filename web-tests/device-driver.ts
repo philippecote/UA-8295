@@ -40,7 +40,7 @@ export class HeadlessDeviceDriver {
   }
 
   runCoupledBoot(): void {
-    this.machine.runScheduler(10_000, 80, false);
+    this.machine.runScheduler(11_000, 80, false);
   }
 
   runMainInstructions(steps: number): void {

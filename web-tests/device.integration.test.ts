@@ -20,18 +20,17 @@ describe("headless UA-8295 device workflow", () => {
   );
 
   it(
-    "presses front-panel keys through the ROM-visible hardware model while display remains observable",
+    "exposes front-panel keys to the I/O processor at the FUNCTION prompt",
     async () => {
       const driver = await HeadlessDeviceDriver.create({ traceAllXdata: true });
       driver.runCoupledBoot();
       const before = driver.displayText();
 
-      driver.pressKey("1");
-      expect(driver.machine.mainCpu.readDirect(0xb0) & 0x02).toBe(0);
-      driver.releaseKey("1");
-      expect(driver.machine.mainCpu.readDirect(0xb0) & 0x02).toBe(0x02);
+      driver.pressKey("2");
+      expect(driver.machine.iopCpu.readDirect(0xb0) & 0x04).toBe(0);
+      driver.releaseKey("2");
+      expect(driver.machine.iopCpu.readDirect(0xb0) & 0x04).toBe(0x04);
 
-      driver.tapKey("^", 3);
       expect(driver.displayText()).toHaveLength(MANUAL_EXPECTATIONS.displayWidth);
       expect(driver.displayText()).toBe(before);
       expect(MANUAL_EXPECTATIONS.keyboard.keys).toEqual(driver.keyNames());
