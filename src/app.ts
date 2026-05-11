@@ -1,5 +1,7 @@
 import "./styles.css";
 import { FRONT_PANEL_KEYS, type FrontPanelKey } from "./devices";
+
+const BINDABLE_KEYS = new Set<FrontPanelKey>(FRONT_PANEL_KEYS);
 import { hex } from "./memory";
 import { formatTrace, type TraceEntry } from "./mcs51";
 import { loadBundledRomSet, loadRomSetFromFiles, ROM_SPECS, type RomSet } from "./roms";
@@ -15,6 +17,7 @@ const state: {
   ioKindFilter: TraceEventKind | "all";
   traceAllXdata: boolean;
   continuousRun: boolean;
+  uiMode: "device" | "developer";
   status: string;
 } = {
   roms: null,
@@ -25,6 +28,7 @@ const state: {
   ioKindFilter: "all",
   traceAllXdata: false,
   continuousRun: false,
+  uiMode: "device",
   status: "Load ROMs to start."
 };
 
@@ -34,8 +38,75 @@ if (!appElement) {
 }
 const app = appElement;
 let animationHandle: number | null = null;
+let continuousFrameCount = 0;
+let globalKeyboardAttached = false;
+const physicalKeysDown = new Map<string, FrontPanelKey>();
+// Maps host-keyboard codes (event.key, event.code) to FrontPanelKey targets. The
+// real device keyboard is uppercase-only, so a-z host keys all route to the
+// uppercase letter entries. Letter shortcuts to function keys ("c" → CONF,
+// "t" → TIME, etc.) are intentionally NOT included now that the alphabetic keys
+// are bound; users can still reach the function keys via their on-screen labels
+// or the side column. Shift behaves as the physical SHIFT (`^`) modifier.
+const PHYSICAL_KEY_MAP = new Map<string, FrontPanelKey>([
+  ["Backspace", "DEL"],
+  ["Delete", "DEL"],
+  ["Escape", "^"],
+  ["Shift", "^"],
+  ["Enter", "="],
+  [" ", "SPACE"],
+  ["ArrowLeft", "SCROLL_LEFT"],
+  ["ArrowRight", "SCROLL_RIGHT"],
+  [",", ","],
+  [".", "."],
+  ["-", "-"],
+  ["=", "="],
+  // Digits.
+  ["0", "0"],
+  ["1", "1"],
+  ["2", "2"],
+  ["3", "3"],
+  ["4", "4"],
+  ["5", "5"],
+  ["6", "6"],
+  ["7", "7"],
+  ["8", "8"],
+  ["9", "9"],
+  // Alphas (lowercase host keys → uppercase device keys).
+  ["a", "A"], ["b", "B"], ["c", "C"], ["d", "D"], ["e", "E"], ["f", "F"], ["g", "G"],
+  ["h", "H"], ["i", "I"], ["j", "J"], ["k", "K"], ["l", "L"], ["m", "M"], ["n", "N"],
+  ["o", "O"], ["p", "P"], ["q", "Q"], ["r", "R"], ["s", "S"], ["t", "T"], ["u", "U"],
+  ["v", "V"], ["w", "W"], ["x", "X"], ["y", "Y"], ["z", "Z"]
+]);
 
-render();
+queueMicrotask(render);
+queueMicrotask(installDebugSurface);
+
+declare global {
+  interface Window {
+    __ua8295?: {
+      pressKey: (k: FrontPanelKey) => void;
+      releaseKey: (k: FrontPanelKey) => void;
+      probe: () => Record<string, unknown>;
+    };
+  }
+}
+
+function installDebugSurface(): void {
+  window.__ua8295 = {
+    pressKey: (k) => setKey(k, true),
+    releaseKey: (k) => setKey(k, false),
+    probe: () => ({
+      display: state.machine?.hardware.display.displayLine(),
+      pressedKeys: state.machine?.hardware.keyboard.pressedKeys() ?? [],
+      heldKeys: Array.from(heldKeys.entries()).map(([k, v]) => ({ key: k, ...v })),
+      mainPC: state.machine?.mainCpu.snapshot().pc.toString(16),
+      iram1c: state.machine?.mainCpu.iram[0x1c].toString(16),
+      iram20: state.machine?.mainCpu.iram[0x20].toString(16),
+      continuousRun: state.continuousRun,
+      status: state.status
+    })
+  };
+}
 
 function render(): void {
   const cpu = state.machine?.cpu(state.activeCpu);
@@ -54,20 +125,47 @@ function render(): void {
     .join("");
 
   app.innerHTML = `
+    <header class="top-bar">
+      <div>
+        <strong>UA-8295 Emulator</strong>
+        <span>${state.status}</span>
+        <div class="rom-badges">${renderRomBadges()}</div>
+      </div>
+      <div class="top-actions">
+        <button data-action="load-bundled">Load bundled ROMs</button>
+        <button data-action="continuous" ${state.machine ? "" : "disabled"}>${state.continuousRun ? "Pause" : "Run"}</button>
+        <button data-action="toggle-ui-mode">${state.uiMode === "developer" ? "Device Mode" : "Developer Mode"}</button>
+      </div>
+    </header>
+
     <section class="hero">
       <div>
         <p class="eyebrow">Philips UA-8295 / Nokia DA-8520</p>
-        <h1>Browser ROM Emulator</h1>
-        <p>This is the browser-native TypeScript port of the 80C31 emulator. It executes the public EPROM images locally and exposes CPU state while the device peripherals are reverse engineered.</p>
+        <h1>${state.uiMode === "developer" ? "Browser ROM Emulator" : "Short-Burst Message Terminal"}</h1>
+        <p>${state.uiMode === "developer" ? "Developer Mode exposes CPU state, ROM validation, traces, and decoded I/O while the device peripherals are reverse engineered." : "Device Mode presents the firmware-driven terminal without the engineering panels. Load the bundled ROMs, run the device, and operate the front-panel keys."}</p>
       </div>
       <div class="device">
-        <div class="display">${displayText ?? displayLine(snapshot)}</div>
+        <div class="device-label">PHILIPS USFA UA-8295/00</div>
+        <div class="display-section">
+          <div class="display-bezel">${renderDisplay(displayText ?? displayLine(snapshot))}</div>
+          <div class="indicator-panel">
+            <div class="indicator-row">
+              <span>BATTERY LOW</span>
+              <span>CHARGE</span>
+              <span>MESSAGE</span>
+              <span>TRANSMIT</span>
+            </div>
+            <div class="brand">PHILIPS<br>USFA B.V</div>
+          </div>
+        </div>
         <div class="keyboard">${renderKeys()}</div>
-        <div class="keyboard-status">${state.machine?.hardware.keyboard.describe() ?? "Keyboard inactive"}</div>
-        <div class="display-details">${renderDisplayDetails()}</div>
+        ${state.uiMode === "developer" ? `<div class="keyboard-status">${state.machine?.hardware.keyboard.describe() ?? "Keyboard inactive"}</div><div class="display-details">${renderDisplayDetails()}</div>` : ""}
       </div>
     </section>
 
+    ${
+      state.uiMode === "developer"
+        ? `
     <section class="panel controls">
       <button data-action="load-bundled">Load bundled ROMs</button>
       <label class="file-button">
@@ -153,6 +251,9 @@ function render(): void {
       <h2>Memory Map</h2>
       <ul>${state.machine?.describeMemoryMap().map((line) => `<li>${line}</li>`).join("") ?? "<li>Load ROMs to initialize the machine.</li>"}</ul>
     </section>
+    `
+        : ""
+    }
   `;
 
   app.querySelector('[data-action="load-bundled"]')?.addEventListener("click", () => void loadBundled());
@@ -174,6 +275,7 @@ function render(): void {
   app.querySelector('[data-action="run-both-1000"]')?.addEventListener("click", () => runBoth(1000));
   app.querySelector('[data-action="run-frame"]')?.addEventListener("click", () => runFrame());
   app.querySelector('[data-action="continuous"]')?.addEventListener("click", toggleContinuousRun);
+  app.querySelector('[data-action="toggle-ui-mode"]')?.addEventListener("click", toggleUiMode);
   app.querySelector<HTMLInputElement>('[data-action="trace-all-xdata"]')?.addEventListener("change", (event: Event) => {
     const input = event.currentTarget;
     if (!(input instanceof HTMLInputElement)) return;
@@ -197,14 +299,19 @@ function render(): void {
   app.querySelectorAll<HTMLButtonElement>("[data-key]").forEach((button) => {
     const key = button.dataset.key as FrontPanelKey | undefined;
     if (!key) return;
-    button.addEventListener("pointerdown", () => setKey(key, true));
+    button.addEventListener("pointerdown", (event: PointerEvent) => {
+      button.setPointerCapture(event.pointerId);
+      setKey(key, true);
+    });
     button.addEventListener("pointerup", () => setKey(key, false));
+    button.addEventListener("pointercancel", () => setKey(key, false));
     button.addEventListener("pointerleave", () => setKey(key, false));
     button.addEventListener("keydown", (event) => {
-      if (event.key === " " || event.key === "Enter") setKey(key, true);
+      if ((event.key === " " || event.key === "Enter") && !event.repeat) setKey(key, true);
     });
     button.addEventListener("keyup", () => setKey(key, false));
   });
+  attachGlobalKeyboard();
 }
 
 async function loadBundled(): Promise<void> {
@@ -239,6 +346,7 @@ function installMachine(roms: RomSet, status: string): void {
   });
   state.trace = [];
   state.status = status;
+  applyTraceRecordingForMode();
   render();
 }
 
@@ -275,18 +383,70 @@ function runBoth(steps: number): void {
   render();
 }
 
-function runFrame(): void {
+function runFrame(renderAfter = true): void {
   const machine = state.machine;
   if (!machine) return;
   try {
-    const result = machine.runScheduler(60, 4, true);
-    appendInstructionTrace([...result.main, ...result.iop]);
+    const trace = state.uiMode === "developer";
+    const result = machine.runScheduler(40, 80, trace);
+    if (trace) appendInstructionTrace([...result.main, ...result.iop]);
     state.status = "Ran one scheduler frame.";
   } catch (error) {
     stopContinuousRun();
     state.status = `CPU stopped: ${error instanceof Error ? error.message : String(error)}`;
+    render();
+    return;
   }
-  render();
+  if (renderAfter) render();
+}
+
+/**
+ * Run as many scheduler slices as fit in `budgetMs` of real time. Targets
+ * near-real-device CPU speed without ever blowing past one animation frame.
+ *
+ * The 80C31 ran at ~922k instructions/sec; at 60 FPS that's ~15k instructions
+ * per frame. With a 12 ms budget out of a 16.7 ms frame we get plenty of
+ * headroom for the browser to paint and respond to input. The previous fixed
+ * `runScheduler(40, 80)` only emulated ~3,200 instructions/frame (~20% of
+ * real speed), which left key-press handshakes too short to advance prompts.
+ */
+function runFrameTimeBudgeted(budgetMs: number = 12): void {
+  const machine = state.machine;
+  if (!machine) return;
+  const start = performance.now();
+  // Larger chunks amortize the per-call overhead of `runScheduler` (which
+  // currently allocates a result array and pushes per-instruction trace entries
+  // even when tracing is off). 64 slices ≈ 5,120 instructions/CPU per call.
+  const SLICES_PER_CHUNK = 64;
+  try {
+    while (performance.now() - start < budgetMs) {
+      machine.runScheduler(SLICES_PER_CHUNK, 80, false);
+      advanceKeyHolds(SLICES_PER_CHUNK);
+    }
+  } catch (error) {
+    stopContinuousRun();
+    state.status = `CPU stopped: ${error instanceof Error ? error.message : String(error)}`;
+    render();
+  }
+}
+
+/**
+ * Cheap per-frame render that only touches the display cells and the
+ * indicator/status surfaces — no full DOM rebuild, no event-handler churn.
+ * Falls back to a full `render()` if the partial DOM hasn't been built yet.
+ */
+function renderDeviceTick(): void {
+  const machine = state.machine;
+  if (!machine) return;
+  const bezel = app.querySelector<HTMLElement>(".display-bezel");
+  if (!bezel) {
+    render();
+    return;
+  }
+  const text = machine.hardware.display.displayLine();
+  bezel.innerHTML = renderDisplay(text);
+  const status = app.querySelector<HTMLElement>(".top-bar span");
+  if (status) status.textContent = state.status;
 }
 
 function toggleContinuousRun(): void {
@@ -297,15 +457,46 @@ function toggleContinuousRun(): void {
     return;
   }
   state.continuousRun = true;
+  continuousFrameCount = 0;
   state.status = "Continuous run active.";
   scheduleContinuousRun();
   render();
 }
 
+function toggleUiMode(): void {
+  state.uiMode = state.uiMode === "developer" ? "device" : "developer";
+  state.status = state.uiMode === "developer" ? "Developer Mode active." : "Device Mode active.";
+  applyTraceRecordingForMode();
+  render();
+}
+
+/**
+ * The trace log is the dominant per-instruction cost in the emulator. Disable
+ * it whenever we're in pure Device Mode (the user only cares about the
+ * firmware behavior); enable it again when the developer panel is visible.
+ */
+function applyTraceRecordingForMode(): void {
+  const log = state.machine?.traceLog;
+  if (!log) return;
+  log.setRecording(state.uiMode === "developer");
+}
+
 function scheduleContinuousRun(): void {
   if (!state.continuousRun) return;
   animationHandle = requestAnimationFrame(() => {
-    runFrame();
+    continuousFrameCount += 1;
+    runFrameTimeBudgeted(12);
+    if (state.uiMode === "device") {
+      // Cheap partial render every animation frame keeps the display fluid.
+      renderDeviceTick();
+    } else if (continuousFrameCount % 30 === 0) {
+      // Developer mode needs the trace + summary panels refreshed periodically;
+      // every 30 frames (~0.5 s) is enough and avoids churning the DOM.
+      render();
+    } else {
+      // In dev mode between full renders, still keep the display visible.
+      renderDeviceTick();
+    }
     scheduleContinuousRun();
   });
 }
@@ -331,12 +522,92 @@ function clearIoTrace(): void {
   render();
 }
 
+/**
+ * Minimum number of scheduler slices a key must remain "pressed" before we
+ * honor a release request. This guarantees the firmware's keyboard scan +
+ * bit-banged P3.3 handshake + 0x080D dispatcher all get enough CPU time to
+ * complete, regardless of how fast the user clicks (browser-synthesized clicks
+ * fire pointerdown and pointerup within a millisecond).
+ *
+ * Tied to scheduler progress rather than wallclock so the model is robust
+ * against animation-frame throttling (e.g. backgrounded tabs) and matches the
+ * semantics our headless tests rely on (which all hold for >=250 slices).
+ *
+ * 800 slices × 80 instructions ≈ 64 k main-CPU instructions ≈ 70 ms of real
+ * 11 MHz device time — well above the ~5–15 k the firmware actually needs.
+ */
+const MIN_KEY_HOLD_SLICES = 800;
+type HeldKeyState = { slicesHeld: number; releaseRequested: boolean };
+const heldKeys = new Map<FrontPanelKey, HeldKeyState>();
+
 function setKey(key: FrontPanelKey, isPressed: boolean): void {
   const machine = state.machine;
   if (!machine) return;
-  machine.hardware.keyboard.setPressed(key, isPressed);
-  state.status = isPressed ? `Pressed ${key}.` : `Released ${key}.`;
-  render();
+  if (isPressed) {
+    heldKeys.set(key, { slicesHeld: 0, releaseRequested: false });
+    machine.hardware.keyboard.setPressed(key, true);
+    setStatus(`Pressed ${key}.`);
+    return;
+  }
+  const entry = heldKeys.get(key);
+  if (!entry) return;
+  entry.releaseRequested = true;
+  if (entry.slicesHeld >= MIN_KEY_HOLD_SLICES) {
+    machine.hardware.keyboard.setPressed(key, false);
+    heldKeys.delete(key);
+    setStatus(`Released ${key}.`);
+  }
+}
+
+/**
+ * Advances `slicesHeld` for every currently-pressed key by `slicesRun`, and
+ * fires the actual `setPressed(false)` once a release has been requested AND
+ * the minimum hold has been satisfied.
+ */
+function advanceKeyHolds(slicesRun: number): void {
+  if (heldKeys.size === 0 || slicesRun <= 0) return;
+  const machine = state.machine;
+  if (!machine) return;
+  for (const [key, entry] of heldKeys) {
+    entry.slicesHeld += slicesRun;
+    if (entry.releaseRequested && entry.slicesHeld >= MIN_KEY_HOLD_SLICES) {
+      machine.hardware.keyboard.setPressed(key, false);
+      heldKeys.delete(key);
+    }
+  }
+}
+
+function setStatus(text: string): void {
+  state.status = text;
+  const statusEl = app.querySelector<HTMLElement>(".top-bar span");
+  if (statusEl) statusEl.textContent = text;
+}
+
+function attachGlobalKeyboard(): void {
+  if (globalKeyboardAttached) return;
+  globalKeyboardAttached = true;
+  window.addEventListener("keydown", (event: KeyboardEvent) => {
+    const key = PHYSICAL_KEY_MAP.get(event.key) ?? PHYSICAL_KEY_MAP.get(event.key.toLowerCase());
+    if (!key || event.repeat || isTypingTarget(event.target)) return;
+    physicalKeysDown.set(event.code, key);
+    setKey(key, true);
+    event.preventDefault();
+  });
+  window.addEventListener("keyup", (event: KeyboardEvent) => {
+    const key = physicalKeysDown.get(event.code);
+    if (!key) return;
+    physicalKeysDown.delete(event.code);
+    setKey(key, false);
+    event.preventDefault();
+  });
+  window.addEventListener("blur", () => {
+    for (const key of new Set(physicalKeysDown.values())) setKey(key, false);
+    physicalKeysDown.clear();
+  });
+}
+
+function isTypingTarget(target: EventTarget | null): boolean {
+  return target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement || target instanceof HTMLSelectElement;
 }
 
 function renderSnapshot(snapshot: ReturnType<UA8295Machine["mainCpu"]["snapshot"]>): string {
@@ -358,13 +629,163 @@ function displayLine(snapshot: ReturnType<UA8295Machine["mainCpu"]["snapshot"]> 
   return `${state.activeCpu.toUpperCase()} PC ${hex(snapshot.pc, 4)}  A ${hex(snapshot.a, 2)}`;
 }
 
+type KeyVariant =
+  | "digit"
+  | "letter"
+  | "punct"
+  | "fn"
+  | "shift"
+  | "scroll"
+  | "space"
+  | "send"
+  | "side";
+
+type KeySpec = {
+  /** Canonical visible label - also used for aria-label and as a stable string for tests. */
+  label: string;
+  /** Optional multi-line render. Defaults to [label]. Use [] to render no visible legend (e.g. spacebar). */
+  lines?: string[];
+  /** Bound FrontPanelKey if the firmware has a slot for this key. Stubs omit this. */
+  binding?: FrontPanelKey;
+  variant: KeyVariant;
+  /** Override aria-label when the legend is symbolic (e.g. shift caret, cursor scroll). */
+  ariaLabel?: string;
+  /** Grid column span within the 12-column row. */
+  span?: number;
+};
+
+const KEYBOARD_ROWS: KeySpec[][] = [
+  // Row 1: digits 1-0, DELETE, ACK NAK
+  [
+    { label: "1", binding: "1", variant: "digit" },
+    { label: "2", binding: "2", variant: "digit" },
+    { label: "3", binding: "3", variant: "digit" },
+    { label: "4", binding: "4", variant: "digit" },
+    { label: "5", binding: "5", variant: "digit" },
+    { label: "6", binding: "6", variant: "digit" },
+    { label: "7", binding: "7", variant: "digit" },
+    { label: "8", binding: "8", variant: "digit" },
+    { label: "9", binding: "9", variant: "digit" },
+    { label: "0", binding: "0", variant: "digit" },
+    { label: "DELETE", binding: "DEL", variant: "fn" },
+    { label: "ACK NAK", lines: ["ACK", "NAK"], binding: "ACK_NAK", variant: "fn", ariaLabel: "Ack/Nak" }
+  ],
+  // Row 2: QWERTY top row, DISPL
+  [
+    { label: "Q", binding: "Q", variant: "letter" },
+    { label: "W", binding: "W", variant: "letter" },
+    { label: "E", binding: "E", variant: "letter" },
+    { label: "R", binding: "R", variant: "letter" },
+    { label: "T", binding: "T", variant: "letter" },
+    { label: "Y", binding: "Y", variant: "letter" },
+    { label: "U", binding: "U", variant: "letter" },
+    { label: "I", binding: "I", variant: "letter" },
+    { label: "O", binding: "O", variant: "letter" },
+    { label: "P", binding: "P", variant: "letter" },
+    { label: "DISPL", binding: "DISPL", variant: "fn", span: 2 }
+  ],
+  // Row 3: home row, =, INPUT PRINT
+  [
+    { label: "A", binding: "A", variant: "letter" },
+    { label: "S", binding: "S", variant: "letter" },
+    { label: "D", binding: "D", variant: "letter" },
+    { label: "F", binding: "F", variant: "letter" },
+    { label: "G", binding: "G", variant: "letter" },
+    { label: "H", binding: "H", variant: "letter" },
+    { label: "J", binding: "J", variant: "letter" },
+    { label: "K", binding: "K", variant: "letter" },
+    { label: "L", binding: "L", variant: "letter" },
+    { label: "=", binding: "=", variant: "punct" },
+    { label: "INPUT PRINT", lines: ["INPUT", "PRINT"], binding: "INPUT_PRINT", variant: "fn", span: 2 }
+  ],
+  // Row 4: shift, ZXC..., punctuation, ENCR DECR
+  [
+    { label: "^", binding: "^", variant: "shift", ariaLabel: "Shift" },
+    { label: "Z", binding: "Z", variant: "letter" },
+    { label: "X", binding: "X", variant: "letter" },
+    { label: "C", binding: "C", variant: "letter" },
+    { label: "V", binding: "V", variant: "letter" },
+    { label: "B", binding: "B", variant: "letter" },
+    { label: "N", binding: "N", variant: "letter" },
+    { label: "M", binding: "M", variant: "letter" },
+    { label: ",", binding: ",", variant: "punct" },
+    { label: ".", binding: ".", variant: "punct" },
+    { label: "-", binding: "-", variant: "punct" },
+    { label: "ENCR DECR", lines: ["ENCR", "DECR"], binding: "ENCR", variant: "fn" }
+  ],
+  // Row 5: cursor scroll left, spacebar, cursor scroll right, SEND
+  [
+    { label: "Cursor Scroll Left", lines: ["←|→"], binding: "SCROLL_LEFT", variant: "scroll", ariaLabel: "Cursor scroll left" },
+    { label: "SPACE", lines: [], binding: "SPACE", variant: "space", span: 8, ariaLabel: "Space" },
+    { label: "Cursor Scroll Right", lines: ["←|→"], binding: "SCROLL_RIGHT", variant: "scroll", ariaLabel: "Cursor scroll right" },
+    { label: "SEND", binding: "SEND", variant: "send", span: 2 }
+  ]
+];
+
+const SIDE_COLUMN_KEYS: KeySpec[] = [
+  { label: "ON OFF", lines: ["ON", "OFF"], binding: "ON_OFF", variant: "side" },
+  { label: "TIME BRIGHT", lines: ["TIME", "BRIGHT"], binding: "TIME", variant: "side" },
+  { label: "NEW KEY", lines: ["NEW", "KEY"], binding: "KEY", variant: "side" },
+  { label: "CONF", binding: "CONF", variant: "side" },
+  { label: "SHORT TERM", lines: ["SHORT", "TERM"], binding: "SHORT_TERM", variant: "side" }
+];
+
 function renderKeys(): string {
-  return FRONT_PANEL_KEYS.map((key) => `<button data-key="${key}" ${state.machine ? "" : "disabled"}>${key}</button>`).join("");
+  const main = KEYBOARD_ROWS.map((row, idx) => {
+    const cells = row.map(renderKey).join("");
+    return `<div class="key-row keyboard-row-${idx + 1}">${cells}</div>`;
+  }).join("");
+  const side = SIDE_COLUMN_KEYS.map(renderKey).join("");
+  return `
+    <div class="keypad">
+      <div class="keypad-main" aria-label="Main keypad">${main}</div>
+      <div class="fn-column" aria-label="Side function column">${side}</div>
+    </div>
+  `;
+}
+
+function renderKey(spec: KeySpec): string {
+  const lines = spec.lines ?? [spec.label];
+  const inner = lines.map((line) => `<span>${escapeHtml(line)}</span>`).join("");
+  const isBound = Boolean(spec.binding && BINDABLE_KEYS.has(spec.binding));
+  const stubClass = isBound ? "" : " is-stub";
+  const variantClass = ` key-${spec.variant}`;
+  const dataKeyAttr = isBound ? ` data-key="${escapeHtml(spec.binding ?? "")}"` : "";
+  const isDisabled = !isBound || !state.machine;
+  const disabledAttr = isDisabled ? " disabled" : "";
+  const ariaLabel = spec.ariaLabel ?? spec.label;
+  const span = spec.span ?? 1;
+  const styleAttr = span > 1 ? ` style="grid-column: span ${span};"` : "";
+  return `<button class="key${variantClass}${stubClass}"${dataKeyAttr}${styleAttr} aria-label="${escapeHtml(ariaLabel)}"${disabledAttr}>${inner}</button>`;
+}
+
+function renderDisplay(text: string): string {
+  const cells = text
+    .slice(0, 32)
+    .padEnd(32, " ")
+    .split("")
+    .map((char, index) => {
+      const isBlank = char === " ";
+      const isCursor = index === 31 && char === "?";
+      return `<span class="display-cell${isBlank ? " is-blank" : ""}${isCursor ? " is-cursor" : ""}">${escapeHtml(char === " " ? "\u00a0" : char)}</span>`;
+    })
+    .join("");
+  return `<div class="display" aria-label="${escapeHtml(text)}">${cells}</div>`;
 }
 
 function renderDisplayDetails(): string {
   const lines = state.machine?.hardware.display.detailLines() ?? ["Display inactive"];
   return lines.map((line) => `<div>${line}</div>`).join("");
+}
+
+function renderRomBadges(): string {
+  return Object.values(ROM_SPECS)
+    .map((spec) => {
+      const image = state.roms?.[spec.key];
+      const label = image ? `${spec.key}: verified ${image.digest.slice(0, 8)}` : `${spec.key}: missing`;
+      return `<span class="rom-badge ${image ? "is-loaded" : "is-missing"}">${escapeHtml(label)}</span>`;
+    })
+    .join("");
 }
 
 function renderOption(value: string, label: string, selected: string): string {
@@ -376,4 +797,8 @@ function renderHistogram(entries: Array<[string, number]>): string {
     .slice(0, 8)
     .map(([key, count]) => `<li><span>${key}</span><strong>${count.toLocaleString()}</strong></li>`)
     .join("") || "<li>No data yet</li>";
+}
+
+function escapeHtml(value: string): string {
+  return value.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;").replaceAll('"', "&quot;");
 }

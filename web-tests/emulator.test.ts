@@ -1,5 +1,6 @@
 import { readFile } from "node:fs/promises";
 import { describe, expect, it } from "vitest";
+import { HeadlessDeviceDriver } from "./device-driver";
 import { ExternalBus } from "../src/memory";
 import { MCS51 } from "../src/mcs51";
 import { ROM_SPECS, validateImage, type RomSet } from "../src/roms";
@@ -52,6 +53,11 @@ describe("browser MCS-51 core", () => {
     machine.mainCpu.writeDirect(0x99, 0x42);
 
     expect(machine.mainCpu.readDirect(0x98) & 0x02).toBe(0x02);
+    expect(machine.iopCpu.readDirect(0x98) & 0x01).toBe(0);
+    expect(machine.hardware.serial.pendingTransfers()).toHaveLength(1);
+
+    machine.hardware.service();
+
     expect(machine.iopCpu.readDirect(0x99)).toBe(0x42);
     expect(machine.iopCpu.readDirect(0x98) & 0x01).toBe(0x01);
   });
@@ -96,6 +102,72 @@ describe("browser MCS-51 core", () => {
     expect(cpu.snapshot().pc).toBeGreaterThanOrEqual(0x003e);
   });
 
+  it("halts on the undefined 0xA5 opcode", () => {
+    const cpu = new MCS51(new ExternalBus(new Uint8Array([0xa5, 0x00])));
+
+    const entry = cpu.step();
+
+    expect(entry.text).toBe("DB 0xA5");
+    expect(() => cpu.step()).toThrow(/halted/);
+  });
+
+  it("updates bit-addressable internal RAM and carry paths", () => {
+    const cpu = new MCS51(new ExternalBus(new Uint8Array([0xd2, 0x05, 0xa2, 0x05, 0xc2, 0x05, 0x92, 0x06])));
+
+    cpu.run(4);
+
+    expect(cpu.readDirect(0x20) & 0x20).toBe(0);
+    expect(cpu.readDirect(0x20) & 0x40).toBe(0x40);
+    expect(cpu.snapshot().psw & 0x80).toBe(0x80);
+  });
+
+  it("does not advance timers configured as external counters without input edges", () => {
+    const cpu = new MCS51(
+      new ExternalBus(
+        new Uint8Array([
+          0x75, 0x89, 0x05, // MOV TMOD, #mode1 counter
+          0x75, 0x8c, 0x12, // MOV TH0, #0x12
+          0x75, 0x8a, 0x34, // MOV TL0, #0x34
+          0xd2, 0x8c, // SETB TR0
+          0x00,
+          0x00
+        ])
+      )
+    );
+
+    cpu.run(6);
+
+    expect(cpu.readDirect(0x8c)).toBe(0x12);
+    expect(cpu.readDirect(0x8a)).toBe(0x34);
+    expect(cpu.readDirect(0x88) & 0x20).toBe(0);
+  });
+
+  it("preserves serial RB8 mode bit state on receive", () => {
+    const cpu = new MCS51(new ExternalBus(new Uint8Array([0x00])));
+
+    cpu.writeDirect(0x98, 0x90);
+    cpu.receiveSerial(0x66, true);
+    expect(cpu.readDirect(0x99)).toBe(0x66);
+    expect(cpu.readDirect(0x98) & 0x05).toBe(0x05);
+
+    cpu.receiveSerial(0x77, false);
+    expect(cpu.readDirect(0x99)).toBe(0x77);
+    expect(cpu.readDirect(0x98) & 0x05).toBe(0x01);
+  });
+
+  it("dispatches a high-priority serial interrupt before a low-priority timer interrupt", () => {
+    const cpu = new MCS51(new ExternalBus(new Uint8Array(0x40)));
+
+    cpu.writeDirect(0xa8, 0x92); // EA | ET0 | ES
+    cpu.writeDirect(0xb8, 0x10); // PS high priority
+    cpu.writeDirect(0x88, 0x20); // TF0 pending
+    cpu.writeDirect(0x98, 0x01); // RI pending
+    cpu.step();
+
+    expect(cpu.snapshot().pc).toBe(0x0023);
+    expect(cpu.readDirect(0x88) & 0x20).toBe(0x20);
+  });
+
   it("discovers deterministic boot I/O surfaces", async () => {
     const machine = new UA8295Machine(await loadTestRomSet(), {
       cpuTrace: {
@@ -126,6 +198,36 @@ describe("browser MCS-51 core", () => {
       "main:IE"
     ]);
     expect(xdataKeys).toEqual([]);
+  });
+
+  it("can schedule both CPUs by device cycles with service ticks", async () => {
+    const machine = new UA8295Machine(await loadTestRomSet());
+
+    machine.runForCycles(120, { serviceCycles: 12 });
+
+    expect(machine.mainCpu.snapshot().cycles).toBeGreaterThanOrEqual(120);
+    expect(machine.iopCpu.snapshot().cycles).toBeGreaterThanOrEqual(120);
+    expect(machine.traceLog.events.filter((event) => event.kind === "scheduler")).toHaveLength(10);
+  });
+
+  it("saves and restores CPU and external memory state", async () => {
+    const machine = new UA8295Machine(await loadTestRomSet());
+    machine.runForCycles(120);
+    machine.mainBus.writeXdata(MAIN_XRAM_BASE, 0x5a);
+    const saved = machine.saveState();
+
+    machine.runForCycles(120);
+    machine.mainBus.writeXdata(MAIN_XRAM_BASE, 0xa5);
+    machine.loadState(saved);
+
+    expect(machine.mainCpu.snapshot()).toMatchObject({
+      pc: saved.mainCpu.pc,
+      cycles: saved.mainCpu.cycles,
+      a: saved.mainCpu.a,
+      dptr: saved.mainCpu.dptr
+    });
+    expect(machine.mainBus.readXdata(MAIN_XRAM_BASE)).toBe(0x5a);
+    expect(machine.iopCpu.snapshot().pc).toBe(saved.iopCpu.pc);
   });
 
   it("uses hardware port hooks to pass the main CPU self-test path", async () => {
@@ -162,20 +264,261 @@ describe("browser MCS-51 core", () => {
   it("exposes front-panel key state through the main P3 input hook", async () => {
     const machine = new UA8295Machine(await loadTestRomSet());
 
+    // Idle: P3.5 (controller-ready) forced LOW for the main CPU self-test, P3.3
+    // HIGH because no INT1 is in flight, P3.0 follows the latch HIGH default.
     expect(machine.mainCpu.readDirect(0xb0) & 0x20).toBe(0);
     expect(machine.mainCpu.readDirect(0xb0) & 0x08).toBe(0x08);
     expect(machine.mainCpu.readDirect(0xb0) & 0x01).toBe(1);
 
     machine.hardware.keyboard.setPressed("1", true);
-    expect(machine.mainCpu.readDirect(0xb0) & 0x02).toBe(0);
     expect(machine.hardware.keyboard.pressedKeys()).toEqual(["1"]);
+    // The authentic controller drives P3.3 LOW the moment a key is depressed so the
+    // main CPU's INT1 (P3.3 falling-edge) handler can fire on the next tick.
+    expect(machine.mainCpu.readDirect(0xb0) & 0x08).toBe(0);
 
-    machine.mainCpu.writeDirect(0x90, 0xfb);
-    expect(machine.mainCpu.readDirect(0xb0) & 0x02).toBe(0);
-    machine.mainCpu.writeDirect(0x90, 0xf7);
-    expect(machine.mainCpu.readDirect(0xb0) & 0x02).toBe(0x02);
+    // Adding a second pressed key does NOT alter any P3 column bits - the IOP
+    // chip drives 0x8400 + P3.3 directly, the legacy P1 row-select / P3 column
+    // matrix model has been retired.
     machine.hardware.keyboard.setPressed("5", true);
-    expect(machine.mainCpu.readDirect(0xb0) & 0x02).toBe(0);
+    expect(machine.mainCpu.readDirect(0xb0) & 0x08).toBe(0);
+
+    machine.hardware.keyboard.setPressed("1", false);
+    machine.hardware.keyboard.setPressed("5", false);
+    machine.hardware.service();
     expect(machine.mainCpu.readDirect(0xb0) & 0x08).toBe(0x08);
   });
+
+  it("keeps I/O processor peripheral XDATA in a named modem/radio model", async () => {
+    const machine = new UA8295Machine(await loadTestRomSet());
+
+    machine.hardware.writeXdata("iop", 0x1800, 0x5a);
+
+    expect(machine.hardware.readXdata("iop", 0x1800, 0xff, "unmapped")).toBe(0x5a);
+    expect(machine.hardware.modemRadio.snapshot()).toEqual([{ address: 0x1800, value: 0x5a }]);
+  });
+});
+
+describe("authentic INT1 keyboard pipeline", () => {
+  function captureFirmwareLookup(
+    driver: HeadlessDeviceDriver,
+    maxSlices = 6000
+  ): { iramByte: number; readyBitObserved: boolean } {
+    let readyBitObserved = false;
+    let observedIramByte = driver.machine.mainCpu.iram[0x1c];
+    for (let i = 0; i < maxSlices; i += 1) {
+      driver.runSchedulerSlices(1, 1);
+      const iram = driver.machine.mainCpu.iram;
+      if ((iram[0x20] & 0x20) !== 0 && !readyBitObserved) {
+        readyBitObserved = true;
+        observedIramByte = iram[0x1c];
+        return { iramByte: observedIramByte, readyBitObserved };
+      }
+    }
+    return { iramByte: driver.machine.mainCpu.iram[0x1c], readyBitObserved };
+  }
+
+  it(
+    "raises INT1 on a fresh key press and reaches the firmware lookup",
+    async () => {
+      const driver = await HeadlessDeviceDriver.create({ traceAllXdata: false });
+      driver.runCoupledBoot();
+
+      driver.pressKey("^");
+      const { iramByte, readyBitObserved } = captureFirmwareLookup(driver);
+
+      expect(readyBitObserved).toBe(true);
+      expect(iramByte).toBe(0x02);
+    },
+    20_000
+  );
+
+  it(
+    "firmware lookup produces ASCII for a digit key",
+    async () => {
+      const driver = await HeadlessDeviceDriver.create({ traceAllXdata: false });
+      driver.runCoupledBoot();
+
+      driver.pressKey("1");
+      const { iramByte, readyBitObserved } = captureFirmwareLookup(driver);
+
+      expect(readyBitObserved).toBe(true);
+      expect(iramByte).toBe(0x31);
+    },
+    20_000
+  );
+
+  it(
+    "firmware lookup produces correct byte for DEL and runs the cancel handler",
+    async () => {
+      const driver = await HeadlessDeviceDriver.create({ traceAllXdata: false });
+      driver.runCoupledBoot();
+
+      driver.pressKey("DEL");
+      const { iramByte, readyBitObserved } = captureFirmwareLookup(driver);
+
+      expect(readyBitObserved).toBe(true);
+      expect(iramByte).toBe(0x03);
+
+      // Within a few additional slices the idle dispatcher at 0x058D consumes
+      // 0x03 → cancel branch and the firmware redraws "GIVE NUMBER OR FUNCTION?".
+      driver.runSchedulerSlices(400, 80);
+      expect(driver.displayText()).toContain("GIVE NUMBER OR FUNCTION?");
+    },
+    20_000
+  );
+
+  it(
+    "KeyboardScanController records strobe writes",
+    async () => {
+      const driver = await HeadlessDeviceDriver.create({ traceAllXdata: false });
+      driver.runCoupledBoot();
+
+      driver.pressKey("^");
+      driver.runSchedulerSlices(40, 80);
+
+      const strobes = driver.machine.hardware.keyboardScan.recentStrobes();
+      expect(strobes.length).toBeGreaterThanOrEqual(8);
+      expect(strobes.some((value) => (value & 0x80) !== 0)).toBe(true);
+      expect(strobes.some((value) => (value & 0x80) === 0)).toBe(true);
+    },
+    20_000
+  );
+
+  it(
+    "requires key release before re-firing INT1",
+    async () => {
+      const driver = await HeadlessDeviceDriver.create({ traceAllXdata: false });
+      driver.runCoupledBoot();
+
+      driver.pressKey("^");
+      driver.runSchedulerSlices(40, 80);
+      expect(driver.machine.mainCpu.iram[0x1c]).toBe(0x02);
+
+      // Stash a marker into iram[0x1C] so we can detect a re-arm. The firmware will
+      // overwrite it via the lookup at 0x044A only if INT1 fires again.
+      driver.machine.mainCpu.iram[0x1c] = 0xa5;
+      driver.runSchedulerSlices(120, 80);
+      expect(driver.machine.mainCpu.iram[0x1c]).toBe(0xa5);
+
+      driver.releaseKey("^");
+      driver.runSchedulerSlices(40, 80);
+      driver.pressKey("^");
+      driver.runSchedulerSlices(80, 80);
+      expect(driver.machine.mainCpu.iram[0x1c]).toBe(0x02);
+    },
+    20_000
+  );
+
+  it(
+    "produces ASCII for letter A",
+    async () => {
+      const driver = await HeadlessDeviceDriver.create({ traceAllXdata: false });
+      driver.runCoupledBoot();
+
+      driver.pressKey("A");
+      const { iramByte, readyBitObserved } = captureFirmwareLookup(driver);
+
+      expect(readyBitObserved).toBe(true);
+      expect(iramByte).toBe(0x41);
+    },
+    20_000
+  );
+
+  it(
+    "produces ASCII for letter Z",
+    async () => {
+      const driver = await HeadlessDeviceDriver.create({ traceAllXdata: false });
+      driver.runCoupledBoot();
+
+      driver.pressKey("Z");
+      const { iramByte, readyBitObserved } = captureFirmwareLookup(driver);
+
+      expect(readyBitObserved).toBe(true);
+      expect(iramByte).toBe(0x5a);
+    },
+    20_000
+  );
+
+  it(
+    "produces space character for SPACE key",
+    async () => {
+      const driver = await HeadlessDeviceDriver.create({ traceAllXdata: false });
+      driver.runCoupledBoot();
+
+      driver.pressKey("SPACE");
+      const { iramByte, readyBitObserved } = captureFirmwareLookup(driver);
+
+      expect(readyBitObserved).toBe(true);
+      expect(iramByte).toBe(0x20);
+    },
+    20_000
+  );
+
+  it(
+    "produces CR for the = key",
+    async () => {
+      const driver = await HeadlessDeviceDriver.create({ traceAllXdata: false });
+      driver.runCoupledBoot();
+
+      driver.pressKey("=");
+      const { iramByte, readyBitObserved } = captureFirmwareLookup(driver);
+
+      expect(readyBitObserved).toBe(true);
+      expect(iramByte).toBe(0x0d);
+    },
+    20_000
+  );
+
+  it(
+    "SHIFT modifier produces the shifted byte (^+TIME → BRIGHT 0x8E)",
+    async () => {
+      const driver = await HeadlessDeviceDriver.create({ traceAllXdata: false });
+      driver.runCoupledBoot();
+
+      // Press SHIFT first, then TIME, so updateKeyboardScan sees both held when
+      // it next services the scan controller.
+      driver.pressKey("^");
+      driver.pressKey("TIME");
+      const { iramByte, readyBitObserved } = captureFirmwareLookup(driver);
+
+      expect(readyBitObserved).toBe(true);
+      expect(iramByte).toBe(0x8e);
+    },
+    20_000
+  );
+
+  it(
+    "SHIFT held alone still produces cancel (raw 0x00 → byte 0x02)",
+    async () => {
+      const driver = await HeadlessDeviceDriver.create({ traceAllXdata: false });
+      driver.runCoupledBoot();
+
+      driver.pressKey("^");
+      const { iramByte, readyBitObserved } = captureFirmwareLookup(driver);
+
+      expect(readyBitObserved).toBe(true);
+      expect(iramByte).toBe(0x02);
+    },
+    20_000
+  );
+
+  it(
+    "SHIFT modifier triggers the firmware shift-A → '[' CJNE special",
+    async () => {
+      const driver = await HeadlessDeviceDriver.create({ traceAllXdata: false });
+      driver.runCoupledBoot();
+
+      driver.pressKey("^");
+      driver.pressKey("A");
+      const { iramByte, readyBitObserved } = captureFirmwareLookup(driver);
+
+      expect(readyBitObserved).toBe(true);
+      // Raw 0xC1 (= 0x41 | 0x40 once bit 7 lookup adds the shift bit back) is
+      // remapped at 0x043E to 0x5B '[' before being stored at iram[0x1C].
+      expect(iramByte).toBe(0x5b);
+    },
+    20_000
+  );
+
+  it.todo("ON_OFF / SCROLL_LEFT / SCROLL_RIGHT exercise no firmware path yet (no scan code)");
 });

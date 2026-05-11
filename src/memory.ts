@@ -28,6 +28,14 @@ export class ExternalBus {
     this.xramBase = options.xramBase ?? 0;
     this.codeMem = fit64k(code);
     this.xram = new Uint8Array(xramSize);
+    // Mimic real CMOS SRAM / EPROM power-up state: bytes default to 0xFF rather
+    // than the Uint8Array convention of 0x00. The firmware uses 0xFF as the
+    // "empty slot" marker for the message buffer at 0x6800+ (lookup routine at
+    // main code 0x116F reads MOVX, XRLs with #0xFF, then JZ-branches on
+    // empty). Initialising XRAM to 0x00 incorrectly told the firmware every
+    // slot was allocated, which surfaced as a "MEMORY FULL!" prompt during
+    // message entry on the device-mode workflow probe.
+    this.xram.fill(0xff);
     this.textRom = options.textRom ?? new Uint8Array();
     this.defaultRead = options.defaultRead ?? 0xff;
   }

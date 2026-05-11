@@ -13,3 +13,6 @@ build/
 
 # Keep downloaded archives local; the unpacked ROM metadata is validated at runtime.
 Nokia_DA8520_firmware/*.zip
+
+# Playwright MCP scratch artifacts (console logs, page snapshots) from in-loop browser testing.
+.playwright-mcp/

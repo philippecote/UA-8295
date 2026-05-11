@@ -1,6 +1,6 @@
 import { UA8295Hardware } from "./devices";
 import { ExternalBus } from "./memory";
-import { MCS51, type CpuTraceOptions, type TraceEntry } from "./mcs51";
+import { MCS51, type CpuTraceOptions, type MCS51State, type TraceEntry } from "./mcs51";
 import { mainCode, type RomSet } from "./roms";
 import { TraceLog, type CpuName } from "./trace";
 
@@ -17,6 +17,21 @@ export interface UA8295MachineOptions {
 export interface SchedulerRunResult {
   main: TraceEntry[];
   iop: TraceEntry[];
+}
+
+export interface CycleSchedulerOptions {
+  mainRatio?: number;
+  iopRatio?: number;
+  serviceCycles?: number;
+  trace?: boolean;
+}
+
+export interface UA8295MachineState {
+  mainCpu: MCS51State;
+  iopCpu: MCS51State;
+  mainXram: number[];
+  iopXram: number[];
+  schedulerSlices: number;
 }
 
 export class UA8295Machine {
@@ -64,6 +79,24 @@ export class UA8295Machine {
     this.schedulerSlices = 0;
   }
 
+  saveState(): UA8295MachineState {
+    return {
+      mainCpu: this.mainCpu.saveState(),
+      iopCpu: this.iopCpu.saveState(),
+      mainXram: [...this.mainBus.xram],
+      iopXram: [...this.iopBus.xram],
+      schedulerSlices: this.schedulerSlices
+    };
+  }
+
+  loadState(state: UA8295MachineState): void {
+    this.mainCpu.loadState(state.mainCpu);
+    this.iopCpu.loadState(state.iopCpu);
+    this.mainBus.xram.set(state.mainXram.slice(0, this.mainBus.xram.length));
+    this.iopBus.xram.set(state.iopXram.slice(0, this.iopBus.xram.length));
+    this.schedulerSlices = state.schedulerSlices;
+  }
+
   stepCpu(name: CpuName): TraceEntry {
     return this.cpu(name).step();
   }
@@ -84,9 +117,36 @@ export class UA8295Machine {
         operation: "slice",
         steps: stepsPerCpu
       });
+      this.hardware.service();
       result.main.push(...this.mainCpu.run(stepsPerCpu, trace));
       result.iop.push(...this.iopCpu.run(stepsPerCpu, trace));
     }
+    return result;
+  }
+
+  runForCycles(deviceCycles: number, options: CycleSchedulerOptions = {}): SchedulerRunResult {
+    const result: SchedulerRunResult = { main: [], iop: [] };
+    const serviceCycles = Math.max(1, Math.floor(options.serviceCycles ?? 12));
+    const mainRatio = options.mainRatio ?? 1;
+    const iopRatio = options.iopRatio ?? 1;
+    const trace = options.trace ?? false;
+
+    for (let elapsed = 0; elapsed < deviceCycles; elapsed += serviceCycles) {
+      const tickCycles = Math.min(serviceCycles, deviceCycles - elapsed);
+      this.schedulerSlices += 1;
+      this.traceLog.record({
+        kind: "scheduler",
+        cpu: "device",
+        pc: 0,
+        cycle: this.schedulerSlices,
+        operation: "slice",
+        steps: tickCycles
+      });
+      this.hardware.service();
+      result.main.push(...this.runCpuForCycles(this.mainCpu, tickCycles * mainRatio, trace));
+      result.iop.push(...this.runCpuForCycles(this.iopCpu, tickCycles * iopRatio, trace));
+    }
+
     return result;
   }
 
@@ -101,5 +161,15 @@ export class UA8295Machine {
       `iop xdata 0x0000-0x${(IOP_XRAM_SIZE - 1).toString(16).toUpperCase().padStart(4, "0")}: scratch RAM`,
       "iop xdata other addresses: traceable modem/peripheral stubs"
     ];
+  }
+
+  private runCpuForCycles(cpu: MCS51, targetCycles: number, trace: boolean): TraceEntry[] {
+    const entries: TraceEntry[] = [];
+    const startCycles = cpu.snapshot().cycles;
+    while (cpu.snapshot().cycles - startCycles < targetCycles) {
+      const entry = cpu.step();
+      if (trace) entries.push(entry);
+    }
+    return entries;
   }
 }

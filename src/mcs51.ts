@@ -25,7 +25,14 @@ export interface CpuSnapshot {
   cycles: number;
 }
 
-type InterruptSource = "EX0" | "T0" | "EX1" | "T1" | "SERIAL";
+export interface MCS51State extends CpuSnapshot {
+  iram: number[];
+  sfr: Array<[number, number]>;
+  halted: boolean;
+  interruptInService: "low" | "high" | null;
+}
+
+export type InterruptSource = "EX0" | "T0" | "EX1" | "T1" | "SERIAL";
 
 interface PendingInterrupt {
   source: InterruptSource;
@@ -323,6 +330,26 @@ export class MCS51 {
     this.sfr.set(0x98, (scon | 0x01 | (rb8 ? 0x04 : 0)) & (rb8 ? 0xff : 0xfb));
   }
 
+  requestInterrupt(source: InterruptSource): void {
+    switch (source) {
+      case "EX0":
+        this.setSfrBit(0x88, 0x02, true);
+        return;
+      case "T0":
+        this.setSfrBit(0x88, 0x20, true);
+        return;
+      case "EX1":
+        this.setSfrBit(0x88, 0x08, true);
+        return;
+      case "T1":
+        this.setSfrBit(0x88, 0x80, true);
+        return;
+      case "SERIAL":
+        this.setSfrBit(0x98, 0x01, true);
+        return;
+    }
+  }
+
   step(): TraceEntry {
     if (this.halted) {
       throw new CpuError(`${this.name} is halted`);
@@ -555,6 +582,30 @@ export class MCS51 {
 
   snapshot(): CpuSnapshot {
     return { pc: this.pc, a: this.a, b: this.b, psw: this.psw, sp: this.sp, dptr: this.dptr, cycles: this.cycles };
+  }
+
+  saveState(): MCS51State {
+    return {
+      ...this.snapshot(),
+      iram: [...this.iram],
+      sfr: [...this.sfr.entries()],
+      halted: this.halted,
+      interruptInService: this.interruptInService
+    };
+  }
+
+  loadState(state: MCS51State): void {
+    this.pc = u16(state.pc);
+    this.iram.set(state.iram.slice(0, this.iram.length));
+    this.sfr.clear();
+    for (const [address, value] of state.sfr) {
+      this.sfr.set(address & 0xff, value & 0xff);
+    }
+    this.halted = state.halted;
+    this.cycles = state.cycles;
+    this.interruptInService = state.interruptInService;
+    this.activeInstructionPc = null;
+    this.activeOpcode = 0;
   }
 
   private recordSfrAccess(operation: "read" | "write", address: number, value: number, previous?: number): void {
