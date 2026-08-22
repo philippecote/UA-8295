@@ -38,6 +38,11 @@ button:disabled {
   margin: 0 auto;
   max-width: 1180px;
   padding: 2rem;
+  transition: max-width 180ms ease;
+}
+
+#app.is-transmission-mode {
+  max-width: 1760px;
 }
 
 .top-bar {
@@ -101,6 +106,60 @@ button:disabled {
 
 .hero > div:first-child {
   max-width: 720px;
+}
+
+.link-status {
+  color: #95e8bd;
+  font-family: "SFMono-Regular", Consolas, monospace;
+  font-size: 0.8rem;
+  letter-spacing: 0.04em;
+}
+
+.terminals-grid {
+  display: grid;
+  gap: 1rem;
+  min-width: 0;
+}
+
+.terminals-grid.is-linked {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.terminal-shell {
+  border: 1px solid transparent;
+  border-radius: 20px;
+  min-width: 0;
+  padding: 3px;
+}
+
+.terminal-shell.is-active {
+  border-color: #83a5ff;
+}
+
+.terminal-heading {
+  align-items: baseline;
+  color: #c5d1e8;
+  display: flex;
+  justify-content: space-between;
+  padding: 0 0.35rem 0.45rem;
+}
+
+.terminal-heading span {
+  color: #8390a8;
+  font-size: 0.75rem;
+}
+
+.terminals-grid.is-linked .device {
+  padding: 1rem;
+}
+
+.terminals-grid.is-linked .key-row {
+  grid-template-columns: repeat(12, 42px);
+}
+
+.indicator-row .is-on {
+  color: #b11418;
+  text-shadow: 0 0 5px rgb(177 20 24 / 0.45);
 }
 
 .eyebrow {
@@ -234,6 +293,21 @@ h1 {
   overflow: hidden;
   padding: 0.9rem;
   text-shadow: 0 0 12px #ff2e85;
+}
+
+.display.brightness-0 {
+  color: #dc4d91;
+  text-shadow: 0 0 7px rgb(255 46 133 / 0.65);
+}
+
+.display.brightness-1 {
+  color: #f459a3;
+  text-shadow: 0 0 10px rgb(255 46 133 / 0.82);
+}
+
+.display.brightness-2 {
+  color: #ff72b7;
+  text-shadow: 0 0 15px #ff2e85;
 }
 
 .display-cell {
@@ -389,7 +463,7 @@ h1 {
 }
 
 .key.is-stub {
-  /* TODO Phase D: bind the remaining FRONT_PANEL_KEYS so these lose .is-stub. */
+  /* Reserved for layout-only keys when a future chassis variant has no binding. */
   filter: grayscale(0.25) brightness(0.9);
   opacity: 0.7;
 }
@@ -556,6 +630,10 @@ li {
 
   .hero,
   .grid {
+    grid-template-columns: 1fr;
+  }
+
+  .terminals-grid.is-linked {
     grid-template-columns: 1fr;
   }
 }

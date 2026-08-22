@@ -29,6 +29,14 @@ describe("Device Mode UI smoke coverage", () => {
     expect(app).not.toMatch(/<span>RECEIVE<\/span>/);
   });
 
+  it("only expands the app canvas for the two-terminal layout", async () => {
+    const [app, styles] = await Promise.all([readFile("src/app.ts", "utf8"), readFile("src/styles.css", "utf8")]);
+
+    expect(app).toContain('app.classList.toggle("is-transmission-mode", state.appMode === "transmission")');
+    expect(styles).toMatch(/#app\s*{[^}]*max-width:\s*1180px/s);
+    expect(styles).toMatch(/#app\.is-transmission-mode\s*{[^}]*max-width:\s*1760px/s);
+  });
+
   it("describes the QWERTY chassis layout in CSS and source", async () => {
     const [app, styles] = await Promise.all([readFile("src/app.ts", "utf8"), readFile("src/styles.css", "utf8")]);
 
@@ -89,7 +97,7 @@ describe("Device Mode UI smoke coverage", () => {
     // Digits 8 and 9 - previously visible-but-unbound stubs - are now bound.
     expect(app).toMatch(/label: "8"[^}]*binding: "8"/);
     expect(app).toMatch(/label: "9"[^}]*binding: "9"/);
-    // ACK NAK should be bound to the dedicated ACK_NAK key, not the legacy RCV alias.
+    // ACK NAK is a dedicated dual-function key, not a receive shortcut.
     expect(app).toContain('binding: "ACK_NAK"');
     expect(app).not.toMatch(/ACK NAK[^}]*binding: "RCV"/);
   });

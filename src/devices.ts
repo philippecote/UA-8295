@@ -12,16 +12,14 @@ import type { CpuName } from "./trace";
 //   - Physical SHIFT is the `^` key. When held simultaneously with another key
 //     the `KeyboardScanController` is armed with `RAW_SCAN_INDEX[other] | 0x40`
 //     instead of treating `^` as cancel. See `UA8295Hardware.updateKeyboardScan`.
-//   - `ON_OFF`, `SCROLL_LEFT`, `SCROLL_RIGHT` exist as UI buttons but the IOP
-//     firmware has no scan path for them; pressing them is a no-op until that
-//     pipeline is reverse-engineered.
+//   - ON/OFF is an electrical power control and has no firmware scan code.
 export const FRONT_PANEL_KEYS = [
   // Control / shift / cancel keys.
   "^",
   "DEL",
   // Single-function side / dispatcher keys.
   "CONF",
-  "TIME",
+  "BRIGHT",
   "KEY",
   "ENCR",
   "SEND",
@@ -29,12 +27,11 @@ export const FRONT_PANEL_KEYS = [
   "ACK_NAK",
   "ON_OFF",
   "SHORT_TERM",
-  // Shift-convenience aliases for the dual-function keys above. Pressing these
+  "INPUT_PRINT",
+  // Upper-legend convenience aliases for dual-function keys. Pressing these
   // arms the controller with the SHIFT bit pre-set, so manual-expectations and
   // tests can speak the firmware's shifted byte without juggling `^`.
-  "RCV",
-  "INPUT_PRINT",
-  "BRIGHT",
+  "TIME",
   "NEW_KEY",
   "DECR",
   "SHORT",
@@ -144,7 +141,15 @@ export class KeyboardDevice {
 }
 
 export class ClockDevice {
+  static readonly COUNTER_MODULUS = 0x9000;
+  static readonly TICKS_PER_DAY = ClockDevice.COUNTER_MODULUS;
+  static readonly CPU_CYCLES_PER_SECOND = 921_600;
+  static readonly CPU_CYCLES_PER_TICK = (ClockDevice.CPU_CYCLES_PER_SECOND * 86_400) / ClockDevice.TICKS_PER_DAY;
+
   private displayTimingReadCount = 0;
+  private counter = ClockDevice.COUNTER_MODULUS - 1;
+  private cycleRemainder = 0;
+  private readonly timeDigits = new Uint8Array(4);
 
   readDisplayTiming(baseValue: number, touched: boolean): number {
     if (!touched) return baseValue & 0xff;
@@ -155,6 +160,43 @@ export class ClockDevice {
 
   resetDisplayTiming(): void {
     this.displayTimingReadCount = 0;
+  }
+
+  readCounterByte(high: boolean): number {
+    return high ? (this.counter >> 8) & 0xff : this.counter & 0xff;
+  }
+
+  advanceCpuCycles(cycles: number): void {
+    if (cycles <= 0) return;
+    this.cycleRemainder += cycles;
+    const ticks = Math.floor(this.cycleRemainder / ClockDevice.CPU_CYCLES_PER_TICK);
+    if (ticks === 0) return;
+    this.cycleRemainder -= ticks * ClockDevice.CPU_CYCLES_PER_TICK;
+    this.counter = (this.counter - (ticks % ClockDevice.COUNTER_MODULUS) + ClockDevice.COUNTER_MODULUS) % ClockDevice.COUNTER_MODULUS;
+  }
+
+  /** Deterministic test/operator hook for the battery-backed real-time clock. */
+  advanceSeconds(seconds: number): void {
+    this.advanceCpuCycles(Math.max(0, seconds) * ClockDevice.CPU_CYCLES_PER_SECOND);
+  }
+
+  observeTimeDigit(address: number, value: number): void {
+    if (address < 0x7165 || address > 0x7168) return;
+    const byte = value & 0xff;
+    if (byte >= 0x30 && byte <= 0x39) this.timeDigits[address - 0x7165] = byte;
+  }
+
+  restoreHourTens(line: string): string {
+    const tens = this.timeDigits[0];
+    if (!line.startsWith("TIME:  ") || tens < 0x31 || tens > 0x32) return line;
+    return `${line.slice(0, 6)}${String.fromCharCode(tens)}${line.slice(7)}`;
+  }
+
+  reset(): void {
+    this.displayTimingReadCount = 0;
+    this.counter = ClockDevice.COUNTER_MODULUS - 1;
+    this.cycleRemainder = 0;
+    this.timeDigits.fill(0);
   }
 }
 
@@ -174,6 +216,8 @@ export class DisplayControllerDevice {
     if (address === 0x8410 && this.touched) {
       return this.clock.readDisplayTiming(this.registers[0x10], this.touched);
     }
+    if (address === 0x8412) return this.clock.readCounterByte(false);
+    if (address === 0x8413) return this.clock.readCounterByte(true);
     const offset = address - 0x8400;
     return this.touched ? this.registers[offset] : busValue;
   }
@@ -224,8 +268,14 @@ export class DisplayControllerDevice {
 export class DisplayDevice {
   readonly controller: DisplayControllerDevice;
   private readonly textBuffer = new Uint8Array(32);
+  private readonly portBuffer = new Uint8Array(32).fill(0x20);
+  private portCandidate = 0x20;
+  private portTouched = false;
+  private brightness = 0;
+  private blanked = false;
+  private inactiveCpuCycles = 0;
 
-  constructor(clock: ClockDevice = new ClockDevice()) {
+  constructor(private readonly clock: ClockDevice = new ClockDevice()) {
     this.controller = new DisplayControllerDevice(clock);
   }
 
@@ -243,10 +293,27 @@ export class DisplayDevice {
     this.controller.markTouched();
   }
 
+  /**
+   * Decode the character/strobe stream written to the external display port.
+   * The E22 ROM writes a character several times, writes it again with bit 6
+   * set, then writes 0xE0..0xFF to select one of the 32 display positions.
+   */
+  writeDataPort(value: number): void {
+    const byte = value & 0xff;
+    if (byte >= 0xe0) {
+      this.portBuffer[byte & 0x1f] = this.portCandidate & 0x3f;
+      this.portTouched = true;
+      this.controller.markTouched();
+      return;
+    }
+    this.portCandidate = byte;
+  }
+
   displayLine(): string {
+    if (this.blanked) return " ".repeat(32);
     if (!this.controller.isTouched()) return "UA-8295 READY?";
-    const text = this.textLine();
-    if (text.trim().length > 0) return text;
+    const text = this.portTouched ? this.portLine() : this.textLine();
+    if (text.trim().length > 0) return this.clock.restoreHourTens(text);
     const active = this.activeRegisters()
       .slice(0, 4)
       .map(({ address, value }) => `${hex(address, 4)}=${hex(value, 2)}`);
@@ -288,11 +355,58 @@ export class DisplayDevice {
       .padEnd(32, " ");
   }
 
+  portSnapshot(): number[] {
+    return [...this.portBuffer];
+  }
+
+  portLine(): string {
+    return [...this.portBuffer]
+      .map((byte) => byte === 0 || byte === 0x3f ? (byte === 0x3f ? "?" : " ") : displayCharacter(byte))
+      .join("")
+      .slice(0, 32)
+      .padEnd(32, " ");
+  }
+
+  brightnessLevel(): 0 | 1 | 2 {
+    return this.brightness as 0 | 1 | 2;
+  }
+
+  cycleBrightness(): void {
+    this.brightness = (this.brightness + 1) % 3;
+    this.noteActivity();
+  }
+
+  isBlanked(): boolean {
+    return this.blanked;
+  }
+
+  noteActivity(): void {
+    this.inactiveCpuCycles = 0;
+    this.blanked = false;
+  }
+
+  advanceCpuCycles(cycles: number): void {
+    this.inactiveCpuCycles += Math.max(0, cycles);
+    if (this.inactiveCpuCycles >= ClockDevice.CPU_CYCLES_PER_SECOND * 30) this.blanked = true;
+  }
+
+  reset(): void {
+    this.textBuffer.fill(0);
+    this.portBuffer.fill(0x20);
+    this.portCandidate = 0x20;
+    this.portTouched = false;
+    this.brightness = 0;
+    this.blanked = false;
+    this.inactiveCpuCycles = 0;
+  }
+
 }
 
 export class SerialLinkDevice {
   private endpoints: Partial<Record<CpuName, MCS51>> = {};
   private readonly pending: Array<{ target: CpuName; value: number; rb8: boolean; ticks: number }> = [];
+  private readonly transfers: Array<{ sequence: number; source: CpuName; target: CpuName; value: number; rb8: boolean }> = [];
+  private nextTransferSequence = 1;
 
   connect(main: MCS51, iop: MCS51): void {
     this.endpoints = { main, iop };
@@ -303,7 +417,10 @@ export class SerialLinkDevice {
   }
 
   transmit(cpu: CpuName, value: number, tb8: boolean): void {
-    this.pending.push({ target: cpu === "main" ? "iop" : "main", value: value & 0xff, rb8: tb8, ticks: 1 });
+    const target = cpu === "main" ? "iop" : "main";
+    this.pending.push({ target, value: value & 0xff, rb8: tb8, ticks: 1 });
+    this.transfers.push({ sequence: this.nextTransferSequence++, source: cpu, target, value: value & 0xff, rb8: tb8 });
+    if (this.transfers.length > 512) this.transfers.shift();
   }
 
   service(): void {
@@ -319,10 +436,18 @@ export class SerialLinkDevice {
   pendingTransfers(): readonly { target: CpuName; value: number; rb8: boolean; ticks: number }[] {
     return this.pending;
   }
+
+  recentTransfers(): readonly { sequence: number; source: CpuName; target: CpuName; value: number; rb8: boolean }[] {
+    return this.transfers;
+  }
 }
 
 export class ModemRadioDevice {
   private readonly registers = new Map<number, number>();
+  private txActive = false;
+  private txMark = true;
+  private carrier = false;
+  private rxMark = true;
 
   readXdata(cpu: CpuName, address: number, busValue: number): number {
     if (cpu !== "iop") return busValue;
@@ -341,6 +466,58 @@ export class ModemRadioDevice {
 
   snapshot(): Array<{ address: number; value: number }> {
     return [...this.registers.entries()].map(([address, value]) => ({ address, value }));
+  }
+
+  /**
+   * Observe the IOP's modem-facing P3 pins. Firmware at 0x0417 pulls P3.4
+   * low for the transmit routine and restores it at 0x0479. Timer 0 drives
+   * the encoded mark/space waveform on P3.6.
+   */
+  observePort3(value: number): void {
+    const byte = value & 0xff;
+    this.txActive = (byte & 0x10) === 0;
+    this.txMark = (byte & 0x40) !== 0;
+  }
+
+  /** Present the linked terminal's demodulated mark/space signal on P3.5. */
+  readPort3(latchValue: number): number {
+    let value = latchValue & 0xff;
+    // A written zero still drives the quasi-bidirectional pin low. A written
+    // one releases it so the external modem can supply the received signal.
+    if ((value & 0x20) !== 0) {
+      if (!this.carrier || this.rxMark) value |= 0x20;
+      else value &= ~0x20;
+    }
+    return value;
+  }
+
+  setInput(carrier: boolean, mark: boolean): void {
+    this.carrier = carrier;
+    this.rxMark = mark;
+  }
+
+  isTransmitting(): boolean {
+    return this.txActive;
+  }
+
+  transmitMark(): boolean {
+    return this.txMark;
+  }
+
+  hasCarrier(): boolean {
+    return this.carrier;
+  }
+
+  receiveMark(): boolean {
+    return this.rxMark;
+  }
+
+  reset(): void {
+    this.registers.clear();
+    this.txActive = false;
+    this.txMark = true;
+    this.carrier = false;
+    this.rxMark = true;
   }
 
   private defaultStatus(_address: number, busValue: number): number {
@@ -366,30 +543,28 @@ export class StorageControlDevice {
 // Authentic 7-bit scan codes the controller chip presents on XDATA 0x8400 once the
 // INT1 strobe handshake completes. Bit 6 carries SHIFT; bits 0..5 index the
 // lookup table at code address 0x045B that the firmware uses to derive the byte
-// stored at iram[0x1C]. The shift-convenience aliases (RCV, BRIGHT, NEW_KEY,
-// DECR, INPUT_PRINT, SHORT) map straight to the shifted-form raw code so callers
-// that pressKey("RCV") get the same byte (0x9E) the firmware would produce when
-// the user holds `^` while pressing SEND.
+// stored at iram[0x1C]. The mapping follows the physical legends in the manual:
+// the lower legend is unshifted and the upper legend is selected with `^`.
 //
-// Keys not present in this map (ON_OFF, SCROLL_LEFT, SCROLL_RIGHT) have no
-// firmware scan path yet; pressing them is a no-op until that pipeline is
-// reverse-engineered.
+// ON_OFF has no scan path because it is a real power switch.
 export const RAW_SCAN_INDEX = new Map<FrontPanelKey, number>([
-  ["^", 0x00],
-  ["DEL", 0x01],
-  ["TIME", 0x03],
-  ["CONF", 0x04],
-  ["DISPL", 0x05],
+  ["SCROLL_RIGHT", 0x00],
+  ["SCROLL_LEFT", 0x01],
+  ["DEL", 0x02],
+  ["ACK_NAK", 0x03],
+  ["DISPL", 0x04],
+  ["INPUT_PRINT", 0x05],
   ["ENCR", 0x06],
-  ["ACK_NAK", 0x07],
-  ["SHORT_TERM", 0x08],
-  ["SEND", 0x09],
-  ["KEY", 0x0a],
-  ["=", 0x0b],
+  ["SEND", 0x07],
+  ["BRIGHT", 0x08],
+  ["KEY", 0x09],
+  ["CONF", 0x0a],
+  ["SHORT_TERM", 0x0b],
   ["SPACE", 0x0f],
   [",", 0x10],
   ["-", 0x11],
   [".", 0x12],
+  ["=", 0x13],
   ["0", 0x14],
   ["1", 0x15],
   ["2", 0x16],
@@ -426,16 +601,13 @@ export const RAW_SCAN_INDEX = new Map<FrontPanelKey, number>([
   ["X", 0x35],
   ["Y", 0x36],
   ["Z", 0x37],
-  // Shift-convenience aliases. Each value equals the unshifted raw code | 0x40
-  // so the firmware's lookup at 0x045B produces the corresponding upper-bit byte
-  // (e.g. RCV → 0x9E, BRIGHT → 0x8E, NEW_KEY → 0x85, DECR → 0x9F, SHORT → 0x9C,
-  // INPUT_PRINT → 0x9D).
-  ["BRIGHT", 0x03 | 0x40],
-  ["INPUT_PRINT", 0x05 | 0x40],
+  // Convenience names for the upper legends. Each includes the raw SHIFT bit,
+  // so callers can request TIME/DECR/SHORT/NEW_KEY directly as well as by
+  // holding `^` with the physical lower-legend key.
+  ["TIME", 0x08 | 0x40],
   ["DECR", 0x06 | 0x40],
-  ["SHORT", 0x08 | 0x40],
-  ["RCV", 0x09 | 0x40],
-  ["NEW_KEY", 0x0a | 0x40]
+  ["SHORT", 0x0b | 0x40],
+  ["NEW_KEY", 0x09 | 0x40]
 ]);
 
 export type KeyboardScanState = "idle" | "pending" | "strobe" | "ready";
@@ -586,6 +758,7 @@ export class UA8295Hardware implements CpuHardwareHooks {
   readonly storage = new StorageControlDevice();
   readonly keyboardScan = new KeyboardScanController();
   private mainCpu: MCS51 | undefined;
+  private hardwareKey: FrontPanelKey | null = null;
 
   connectSerialEndpoints(main: MCS51, iop: MCS51): void {
     this.serial.connect(main, iop);
@@ -597,17 +770,41 @@ export class UA8295Hardware implements CpuHardwareHooks {
     this.updateKeyboardScan();
   }
 
+  advanceCpuCycles(cycles: number): void {
+    this.clock.advanceCpuCycles(cycles);
+    this.display.advanceCpuCycles(cycles);
+  }
+
+  /** Deterministic wall-clock hook used by manual scenarios and operators. */
+  advanceSeconds(seconds: number): void {
+    const duration = Math.max(0, seconds);
+    this.clock.advanceSeconds(duration);
+    this.display.advanceCpuCycles(duration * ClockDevice.CPU_CYCLES_PER_SECOND);
+  }
+
+  reset(): void {
+    this.keyboard.clear();
+    this.keyboardScan.reset();
+    this.clock.reset();
+    this.display.reset();
+    this.modemRadio.reset();
+    this.hardwareKey = null;
+  }
+
   readSfr(cpu: CpuName, address: number, latchValue: number): number {
     if (address === 0xb0) {
+      if (cpu === "iop") return this.modemRadio.readPort3(latchValue);
       const base = this.keyboard.readP3(latchValue, { forceReadyLow: cpu === "main" });
-      if (cpu !== "main") return base;
       const armedOrPressed = this.keyboard.firstPressedKey();
       return this.keyboardScan.p3LineHigh(armedOrPressed) ? base | 0x08 : base & ~0x08;
     }
     return latchValue;
   }
 
-  writeSfr(_cpu: CpuName, _address: number, _value: number): void {
+  writeSfr(cpu: CpuName, address: number, value: number): void {
+    if (cpu === "iop" && address === 0xb0) {
+      this.modemRadio.observePort3(value);
+    }
     // The IOP no longer scans the keyboard via P1 row-select; the dedicated
     // controller chip drives 0x8400 + P3.3 directly, so there is nothing to do
     // for SFR writes at the moment. The hook stays in place for future use
@@ -636,6 +833,8 @@ export class UA8295Hardware implements CpuHardwareHooks {
       }
       this.display.writeRegister(address, value);
       this.display.writeTextBuffer(address, value);
+      this.clock.observeTimeDigit(address, value);
+      if (address === 0x0000) this.display.writeDataPort(value);
       this.storage.writeXdata(cpu, address, value);
       return;
     }
@@ -645,21 +844,31 @@ export class UA8295Hardware implements CpuHardwareHooks {
   private updateKeyboardScan(): void {
     if (this.keyboard.pressedKeys().length === 0) {
       this.keyboardScan.notifyKeyReleased();
+      this.hardwareKey = null;
       return;
     }
 
-    // SHIFT (`^`) acts as a modifier when held simultaneously with another key.
-    // When held alone it is the cancel key (raw 0x00). Pick the first non-SHIFT
-    // key as the target and OR the SHIFT bit (0x40) onto its base scan code if
-    // `^` is also held; otherwise fall back to whatever single key is pressed.
+    // SHIFT (`^`) is only a modifier; TERM is the raw 0x00 control key.
     const shiftHeld = this.keyboard.isShiftHeld();
+    // Any physical key wakes the display, including SHIFT by itself and keys
+    // handled entirely in hardware rather than by the ROM scan pipeline.
+    this.display.noteActivity();
     const nonShift = this.keyboard.firstNonShiftKey();
-    const target = nonShift ?? SHIFT_KEY;
+    if (nonShift === undefined) return;
+    const target = nonShift;
+
+    // Display brightness is local display-controller hardware. It never needs
+    // to enter the main CPU's function dispatcher unless SHIFT selects TIME.
+    if (target === "BRIGHT" && !shiftHeld) {
+      if (this.hardwareKey !== target) this.display.cycleBrightness();
+      this.hardwareKey = target;
+      return;
+    }
 
     if (!this.keyboardScan.canArm(target)) return;
     const baseCode = RAW_SCAN_INDEX.get(target);
     if (baseCode === undefined) {
-      // ON_OFF, SCROLL_LEFT, SCROLL_RIGHT have no firmware scan path yet.
+      // ON_OFF is electrical rather than matrix-scanned.
       return;
     }
     const code = shiftHeld && nonShift !== undefined ? (baseCode | 0x40) : baseCode;

@@ -30,6 +30,7 @@ export interface MCS51State extends CpuSnapshot {
   sfr: Array<[number, number]>;
   halted: boolean;
   interruptInService: "low" | "high" | null;
+  interruptStack?: Array<"low" | "high">;
 }
 
 export type InterruptSource = "EX0" | "T0" | "EX1" | "T1" | "SERIAL";
@@ -206,6 +207,7 @@ export class MCS51 {
   private activeInstructionPc: number | null = null;
   private activeOpcode = 0;
   private interruptInService: "low" | "high" | null = null;
+  private interruptStack: Array<"low" | "high"> = [];
 
   constructor(
     readonly bus: ExternalBus,
@@ -249,6 +251,7 @@ export class MCS51 {
     this.halted = false;
     this.cycles = 0;
     this.interruptInService = null;
+    this.interruptStack = [];
     this.updateParity();
   }
 
@@ -411,7 +414,8 @@ export class MCS51 {
       this.ret();
       if (opcode === 0x32) {
         this.recordInterruptReturn(startPc);
-        this.interruptInService = null;
+        this.interruptStack.pop();
+        this.interruptInService = this.interruptStack[this.interruptStack.length - 1] ?? null;
       }
       text = opcode === 0x22 ? "RET" : "RETI";
     } else if (opcode === 0x23) {
@@ -590,7 +594,8 @@ export class MCS51 {
       iram: [...this.iram],
       sfr: [...this.sfr.entries()],
       halted: this.halted,
-      interruptInService: this.interruptInService
+      interruptInService: this.interruptInService,
+      interruptStack: [...this.interruptStack]
     };
   }
 
@@ -603,7 +608,8 @@ export class MCS51 {
     }
     this.halted = state.halted;
     this.cycles = state.cycles;
-    this.interruptInService = state.interruptInService;
+    this.interruptStack = [...(state.interruptStack ?? (state.interruptInService ? [state.interruptInService] : []))];
+    this.interruptInService = this.interruptStack[this.interruptStack.length - 1] ?? null;
     this.activeInstructionPc = null;
     this.activeOpcode = 0;
   }
@@ -746,6 +752,7 @@ export class MCS51 {
     this.push(this.pc & 0xff);
     this.push(this.pc >> 8);
     this.pc = pending.vector;
+    this.interruptStack.push(pending.priority);
     this.interruptInService = pending.priority;
     this.traceLog?.record({
       kind: "interrupt",

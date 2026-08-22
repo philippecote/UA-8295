@@ -74,7 +74,7 @@ export class UA8295Machine {
   reset(): void {
     this.mainCpu.reset();
     this.iopCpu.reset();
-    this.hardware.keyboard.clear();
+    this.hardware.reset();
     this.traceLog.clear();
     this.schedulerSlices = 0;
   }
@@ -118,8 +118,10 @@ export class UA8295Machine {
         steps: stepsPerCpu
       });
       this.hardware.service();
+      const mainCyclesBefore = this.mainCpu.snapshot().cycles;
       result.main.push(...this.mainCpu.run(stepsPerCpu, trace));
       result.iop.push(...this.iopCpu.run(stepsPerCpu, trace));
+      this.hardware.advanceCpuCycles(this.mainCpu.snapshot().cycles - mainCyclesBefore);
     }
     return result;
   }
@@ -143,8 +145,10 @@ export class UA8295Machine {
         steps: tickCycles
       });
       this.hardware.service();
+      const mainCyclesBefore = this.mainCpu.snapshot().cycles;
       result.main.push(...this.runCpuForCycles(this.mainCpu, tickCycles * mainRatio, trace));
       result.iop.push(...this.runCpuForCycles(this.iopCpu, tickCycles * iopRatio, trace));
+      this.hardware.advanceCpuCycles(this.mainCpu.snapshot().cycles - mainCyclesBefore);
     }
 
     return result;

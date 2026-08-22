@@ -3,10 +3,9 @@
 Browser-native emulator tooling for the Philips UA-8295 / Nokia DA-8520
 Short-Burst Message Terminal firmware.
 
-The TypeScript implementation is the product: it validates the public EPROM set,
-executes the main CPU and I/O processor ROMs, models emerging front-panel
-hardware behavior, and provides headless integration tests for ROM-backed device
-workflows.
+The TypeScript implementation validates the public EPROM set, executes both
+original 80C31 ROMs, models the complete operator keyboard/display workflow,
+and connects two terminals for encrypted message transfer.
 
 ## Firmware
 
@@ -23,6 +22,16 @@ Place the public Crypto Museum firmware files in `Nokia_DA8520_firmware/`:
 npm run dev
 ```
 
+Device Mode can switch between a single terminal and **Transmission Test**, which
+runs two independent dual-CPU terminals side by side. Their I/O processors are
+connected through a radio link, simultaneous transmission is treated as a
+collision, and each terminal's SRAM is persisted independently in the browser.
+
+To reproduce the automated A-to-B path: load defaults on both units with
+`SHIFT+CONF`, enter a free-format message with `0`, finish with `TERM`, press
+`SEND`, enter receiver `00`, and press `=`. On the receiving unit, press
+`DISPL`, choose message `1`, then use the left scroll key to show its text.
+
 ## Tests
 
 ```sh
@@ -35,9 +44,12 @@ real ROMs, run the coupled main and I/O processor CPUs through initial check-out
 press front-panel keys through the hardware model, and assert the observed
 32-character display text without using a browser.
 
-The acceptance suite is data-driven from manual expectations. It currently
-covers power-up, `CONF`, `KEY`, `TIME`, `ENCR`, `SEND`, `RCV`, `DEL`, numeric
-prompt recovery, display history, trace summaries, and performance budgets.
+The acceptance suite loads executable scenarios from
+`docs/manual-tests/section-3-operation.md`; `docs/manual-conformance.md` tracks
+complete, partial, untested, and hardware-boundary procedures. In addition to
+power-up, configuration, key, time, message-format and editing workflows, an
+end-to-end test composes `HI` on terminal A and verifies that terminal B stores,
+decrypts and displays it through the original main firmware.
 
 ## Architecture
 
@@ -45,6 +57,10 @@ prompt recovery, display history, trace summaries, and performance budgets.
   timers, serial flags, interrupts, MOVX/MOVC access, and save/load of CPU state.
 - `src/ua8295.ts` wires the dual CPUs to ROM, SRAM, a cycle scheduler, and the
   shared hardware model.
+- `src/radio-link.ts` interleaves two complete terminals, carries the IOP
+  waveform/carrier state, and models the external analog modem's recovered-byte
+  output while leaving framing, encryption, checksums, address filtering,
+  storage and display handling to the original firmware.
 - `src/devices.ts` contains named device models for keyboard, display
   controller, serial link, clock, IOP modem/radio bus, and storage/control
   latch gaps.
@@ -63,10 +79,11 @@ prompt recovery, display history, trace summaries, and performance budgets.
 - I/O processor XDATA `0x0000-0x07FF`: scratch RAM; other IOP XDATA accesses go
   through the modem/radio peripheral model.
 
-## Current Limitations
+## Modeling Boundary
 
-The emulator is real-ROM driven, but several hardware details are still modeled
-at prompt-stable fidelity rather than component-perfect fidelity. `SEND`, `RCV`,
-`ENCR`, and some numeric/message editing paths are covered to their current
-stable prompts; deeper radio, modem, crypto/key-storage, and full message-buffer
-behavior still need more trace evidence before they can be treated as exact.
+The digital machine is ROM-driven through message composition, encryption,
+transmission, reception, decryption and SRAM storage. The undocumented analog
+radio front-end is modeled at its two useful boundaries: the IOP's mark/space
+waveform is exposed for link status, while correctly recovered octets are
+delivered to the receiving firmware. Audio-frequency filtering and noisy-channel
+error simulation are intentionally outside the current model.

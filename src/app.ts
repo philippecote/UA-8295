@@ -4,6 +4,7 @@ import { FRONT_PANEL_KEYS, type FrontPanelKey } from "./devices";
 const BINDABLE_KEYS = new Set<FrontPanelKey>(FRONT_PANEL_KEYS);
 import { hex } from "./memory";
 import { formatTrace, type TraceEntry } from "./mcs51";
+import { UA8295LinkedPair } from "./radio-link";
 import { loadBundledRomSet, loadRomSetFromFiles, ROM_SPECS, type RomSet } from "./roms";
 import { UA8295Machine } from "./ua8295";
 import { formatTraceEvent, summarizeTraceEvents, type CpuName, type TraceEventKind } from "./trace";
@@ -11,6 +12,8 @@ import { formatTraceEvent, summarizeTraceEvents, type CpuName, type TraceEventKi
 const state: {
   roms: RomSet | null;
   machine: UA8295Machine | null;
+  peerMachine: UA8295Machine | null;
+  linkedPair: UA8295LinkedPair | null;
   activeCpu: CpuName;
   trace: TraceEntry[];
   ioCpuFilter: CpuName | "device" | "all";
@@ -18,10 +21,14 @@ const state: {
   traceAllXdata: boolean;
   continuousRun: boolean;
   uiMode: "device" | "developer";
+  appMode: "single" | "transmission";
+  activeTerminal: "a" | "b";
   status: string;
 } = {
   roms: null,
   machine: null,
+  peerMachine: null,
+  linkedPair: null,
   activeCpu: "main",
   trace: [],
   ioCpuFilter: "all",
@@ -29,6 +36,8 @@ const state: {
   traceAllXdata: false,
   continuousRun: false,
   uiMode: "device",
+  appMode: "single",
+  activeTerminal: "a",
   status: "Load ROMs to start."
 };
 
@@ -40,7 +49,8 @@ const app = appElement;
 let animationHandle: number | null = null;
 let continuousFrameCount = 0;
 let globalKeyboardAttached = false;
-const physicalKeysDown = new Map<string, FrontPanelKey>();
+const SRAM_STORAGE_PREFIX = "ua8295.sram.v1";
+const physicalKeysDown = new Map<string, { key: FrontPanelKey; terminal: "a" | "b" }>();
 // Maps host-keyboard codes (event.key, event.code) to FrontPanelKey targets. The
 // real device keyboard is uppercase-only, so a-z host keys all route to the
 // uppercase letter entries. Letter shortcuts to function keys ("c" → CONF,
@@ -50,7 +60,7 @@ const physicalKeysDown = new Map<string, FrontPanelKey>();
 const PHYSICAL_KEY_MAP = new Map<string, FrontPanelKey>([
   ["Backspace", "DEL"],
   ["Delete", "DEL"],
-  ["Escape", "^"],
+  ["Escape", "SHORT_TERM"],
   ["Shift", "^"],
   ["Enter", "="],
   [" ", "SPACE"],
@@ -80,6 +90,10 @@ const PHYSICAL_KEY_MAP = new Map<string, FrontPanelKey>([
 
 queueMicrotask(render);
 queueMicrotask(installDebugSurface);
+window.addEventListener("pagehide", persistTerminalMemory);
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "hidden") persistTerminalMemory();
+});
 
 declare global {
   interface Window {
@@ -98,7 +112,7 @@ function installDebugSurface(): void {
     probe: () => ({
       display: state.machine?.hardware.display.displayLine(),
       pressedKeys: state.machine?.hardware.keyboard.pressedKeys() ?? [],
-      heldKeys: Array.from(heldKeys.entries()).map(([k, v]) => ({ key: k, ...v })),
+      heldKeys: Array.from(heldKeys.entries()).map(([id, value]) => ({ id, ...value })),
       mainPC: state.machine?.mainCpu.snapshot().pc.toString(16),
       iram1c: state.machine?.mainCpu.iram[0x1c].toString(16),
       iram20: state.machine?.mainCpu.iram[0x20].toString(16),
@@ -109,9 +123,9 @@ function installDebugSurface(): void {
 }
 
 function render(): void {
+  app.classList.toggle("is-transmission-mode", state.appMode === "transmission");
   const cpu = state.machine?.cpu(state.activeCpu);
   const snapshot = cpu?.snapshot();
-  const displayText = state.machine?.hardware.display.displayLine();
   const ioEvents = state.machine?.traceLog.recent(300, {
     cpu: state.ioCpuFilter,
     kind: state.ioKindFilter
@@ -134,6 +148,7 @@ function render(): void {
       <div class="top-actions">
         <button data-action="load-bundled">Load bundled ROMs</button>
         <button data-action="continuous" ${state.machine ? "" : "disabled"}>${state.continuousRun ? "Pause" : "Run"}</button>
+        <button data-action="toggle-app-mode" ${state.machine ? "" : "disabled"}>${state.appMode === "single" ? "Transmission Test" : "Single Unit"}</button>
         <button data-action="toggle-ui-mode">${state.uiMode === "developer" ? "Device Mode" : "Developer Mode"}</button>
       </div>
     </header>
@@ -144,22 +159,10 @@ function render(): void {
         <h1>${state.uiMode === "developer" ? "Browser ROM Emulator" : "Short-Burst Message Terminal"}</h1>
         <p>${state.uiMode === "developer" ? "Developer Mode exposes CPU state, ROM validation, traces, and decoded I/O while the device peripherals are reverse engineered." : "Device Mode presents the firmware-driven terminal without the engineering panels. Load the bundled ROMs, run the device, and operate the front-panel keys."}</p>
       </div>
-      <div class="device">
-        <div class="device-label">PHILIPS USFA UA-8295/00</div>
-        <div class="display-section">
-          <div class="display-bezel">${renderDisplay(displayText ?? displayLine(snapshot))}</div>
-          <div class="indicator-panel">
-            <div class="indicator-row">
-              <span>BATTERY LOW</span>
-              <span>CHARGE</span>
-              <span>MESSAGE</span>
-              <span>TRANSMIT</span>
-            </div>
-            <div class="brand">PHILIPS<br>USFA B.V</div>
-          </div>
-        </div>
-        <div class="keyboard">${renderKeys()}</div>
-        ${state.uiMode === "developer" ? `<div class="keyboard-status">${state.machine?.hardware.keyboard.describe() ?? "Keyboard inactive"}</div><div class="display-details">${renderDisplayDetails()}</div>` : ""}
+      <div class="link-status">${state.appMode === "transmission" ? `Radio link: ${state.linkedPair?.link.status() ?? "disconnected"}` : "Single terminal"}</div>
+      <div class="terminals-grid ${state.appMode === "transmission" ? "is-linked" : "is-single"}">
+        ${renderTerminal(state.machine, "a", state.appMode === "transmission" ? "TERMINAL A" : "PHILIPS USFA UA-8295/00")}
+        ${state.appMode === "transmission" ? renderTerminal(state.peerMachine, "b", "TERMINAL B") : ""}
       </div>
     </section>
 
@@ -275,6 +278,7 @@ function render(): void {
   app.querySelector('[data-action="run-both-1000"]')?.addEventListener("click", () => runBoth(1000));
   app.querySelector('[data-action="run-frame"]')?.addEventListener("click", () => runFrame());
   app.querySelector('[data-action="continuous"]')?.addEventListener("click", toggleContinuousRun);
+  app.querySelector('[data-action="toggle-app-mode"]')?.addEventListener("click", toggleAppMode);
   app.querySelector('[data-action="toggle-ui-mode"]')?.addEventListener("click", toggleUiMode);
   app.querySelector<HTMLInputElement>('[data-action="trace-all-xdata"]')?.addEventListener("change", (event: Event) => {
     const input = event.currentTarget;
@@ -298,18 +302,20 @@ function render(): void {
   app.querySelector('[data-action="clear-io"]')?.addEventListener("click", clearIoTrace);
   app.querySelectorAll<HTMLButtonElement>("[data-key]").forEach((button) => {
     const key = button.dataset.key as FrontPanelKey | undefined;
+    const terminal = button.dataset.terminal === "b" ? "b" : "a";
     if (!key) return;
     button.addEventListener("pointerdown", (event: PointerEvent) => {
       button.setPointerCapture(event.pointerId);
-      setKey(key, true);
+      state.activeTerminal = terminal;
+      setKey(key, true, terminal);
     });
-    button.addEventListener("pointerup", () => setKey(key, false));
-    button.addEventListener("pointercancel", () => setKey(key, false));
-    button.addEventListener("pointerleave", () => setKey(key, false));
+    button.addEventListener("pointerup", () => setKey(key, false, terminal));
+    button.addEventListener("pointercancel", () => setKey(key, false, terminal));
+    button.addEventListener("pointerleave", () => setKey(key, false, terminal));
     button.addEventListener("keydown", (event) => {
-      if ((event.key === " " || event.key === "Enter") && !event.repeat) setKey(key, true);
+      if ((event.key === " " || event.key === "Enter") && !event.repeat) setKey(key, true, terminal);
     });
-    button.addEventListener("keyup", () => setKey(key, false));
+    button.addEventListener("keyup", () => setKey(key, false, terminal));
   });
   attachGlobalKeyboard();
 }
@@ -344,6 +350,12 @@ function installMachine(roms: RomSet, status: string): void {
       traceAllXdata: state.traceAllXdata
     }
   });
+  state.peerMachine = new UA8295Machine(roms, {
+    cpuTrace: { traceAllXdata: state.traceAllXdata }
+  });
+  state.linkedPair = new UA8295LinkedPair(state.machine, state.peerMachine);
+  restoreTerminalMemory(state.machine, "a");
+  restoreTerminalMemory(state.peerMachine, "b");
   state.trace = [];
   state.status = status;
   applyTraceRecordingForMode();
@@ -420,7 +432,11 @@ function runFrameTimeBudgeted(budgetMs: number = 12): void {
   const SLICES_PER_CHUNK = 64;
   try {
     while (performance.now() - start < budgetMs) {
-      machine.runScheduler(SLICES_PER_CHUNK, 80, false);
+      if (state.appMode === "transmission" && state.linkedPair) {
+        state.linkedPair.runScheduler(SLICES_PER_CHUNK, 80, false);
+      } else {
+        machine.runScheduler(SLICES_PER_CHUNK, 80, false);
+      }
       advanceKeyHolds(SLICES_PER_CHUNK);
     }
   } catch (error) {
@@ -436,15 +452,19 @@ function runFrameTimeBudgeted(budgetMs: number = 12): void {
  * Falls back to a full `render()` if the partial DOM hasn't been built yet.
  */
 function renderDeviceTick(): void {
-  const machine = state.machine;
-  if (!machine) return;
-  const bezel = app.querySelector<HTMLElement>(".display-bezel");
-  if (!bezel) {
+  if (!state.machine) return;
+  const bezels = app.querySelectorAll<HTMLElement>(".display-bezel[data-terminal]");
+  if (!bezels.length) {
     render();
     return;
   }
-  const text = machine.hardware.display.displayLine();
-  bezel.innerHTML = renderDisplay(text);
+  for (const bezel of bezels) {
+    const terminal = bezel.dataset.terminal === "b" ? "b" : "a";
+    const machine = machineFor(terminal);
+    if (machine) bezel.innerHTML = renderDisplay(machine.hardware.display.displayLine(), machine.hardware.display.brightnessLevel());
+  }
+  const linkStatus = app.querySelector<HTMLElement>(".link-status");
+  if (linkStatus) linkStatus.textContent = state.appMode === "transmission" ? `Radio link: ${state.linkedPair?.link.status() ?? "disconnected"}` : "Single terminal";
   const status = app.querySelector<HTMLElement>(".top-bar span");
   if (status) status.textContent = state.status;
 }
@@ -470,15 +490,21 @@ function toggleUiMode(): void {
   render();
 }
 
+function toggleAppMode(): void {
+  state.appMode = state.appMode === "single" ? "transmission" : "single";
+  if (state.appMode === "single") state.activeTerminal = "a";
+  state.status = state.appMode === "transmission" ? "Two linked terminals active." : "Single terminal active.";
+  render();
+}
+
 /**
  * The trace log is the dominant per-instruction cost in the emulator. Disable
  * it whenever we're in pure Device Mode (the user only cares about the
  * firmware behavior); enable it again when the developer panel is visible.
  */
 function applyTraceRecordingForMode(): void {
-  const log = state.machine?.traceLog;
-  if (!log) return;
-  log.setRecording(state.uiMode === "developer");
+  state.machine?.traceLog.setRecording(state.uiMode === "developer");
+  state.peerMachine?.traceLog.setRecording(state.uiMode === "developer");
 }
 
 function scheduleContinuousRun(): void {
@@ -486,6 +512,7 @@ function scheduleContinuousRun(): void {
   animationHandle = requestAnimationFrame(() => {
     continuousFrameCount += 1;
     runFrameTimeBudgeted(12);
+    if (continuousFrameCount % 90 === 0) persistTerminalMemory();
     if (state.uiMode === "device") {
       // Cheap partial render every animation frame keeps the display fluid.
       renderDeviceTick();
@@ -538,23 +565,24 @@ function clearIoTrace(): void {
  */
 const MIN_KEY_HOLD_SLICES = 800;
 type HeldKeyState = { slicesHeld: number; releaseRequested: boolean };
-const heldKeys = new Map<FrontPanelKey, HeldKeyState>();
+const heldKeys = new Map<string, HeldKeyState & { key: FrontPanelKey; terminal: "a" | "b" }>();
 
-function setKey(key: FrontPanelKey, isPressed: boolean): void {
-  const machine = state.machine;
+function setKey(key: FrontPanelKey, isPressed: boolean, terminal: "a" | "b" = state.activeTerminal): void {
+  const machine = machineFor(terminal);
   if (!machine) return;
+  const heldId = `${terminal}:${key}`;
   if (isPressed) {
-    heldKeys.set(key, { slicesHeld: 0, releaseRequested: false });
+    heldKeys.set(heldId, { key, terminal, slicesHeld: 0, releaseRequested: false });
     machine.hardware.keyboard.setPressed(key, true);
     setStatus(`Pressed ${key}.`);
     return;
   }
-  const entry = heldKeys.get(key);
+  const entry = heldKeys.get(heldId);
   if (!entry) return;
   entry.releaseRequested = true;
   if (entry.slicesHeld >= MIN_KEY_HOLD_SLICES) {
     machine.hardware.keyboard.setPressed(key, false);
-    heldKeys.delete(key);
+    heldKeys.delete(heldId);
     setStatus(`Released ${key}.`);
   }
 }
@@ -566,13 +594,13 @@ function setKey(key: FrontPanelKey, isPressed: boolean): void {
  */
 function advanceKeyHolds(slicesRun: number): void {
   if (heldKeys.size === 0 || slicesRun <= 0) return;
-  const machine = state.machine;
-  if (!machine) return;
-  for (const [key, entry] of heldKeys) {
+  for (const [heldId, entry] of heldKeys) {
+    const machine = machineFor(entry.terminal);
+    if (!machine) continue;
     entry.slicesHeld += slicesRun;
     if (entry.releaseRequested && entry.slicesHeld >= MIN_KEY_HOLD_SLICES) {
-      machine.hardware.keyboard.setPressed(key, false);
-      heldKeys.delete(key);
+      machine.hardware.keyboard.setPressed(entry.key, false);
+      heldKeys.delete(heldId);
     }
   }
 }
@@ -583,25 +611,57 @@ function setStatus(text: string): void {
   if (statusEl) statusEl.textContent = text;
 }
 
+function persistTerminalMemory(): void {
+  for (const terminal of ["a", "b"] as const) {
+    const machine = machineFor(terminal);
+    if (!machine) continue;
+    try {
+      const bytes = machine.mainBus.xram;
+      let binary = "";
+      for (let offset = 0; offset < bytes.length; offset += 0x1000) {
+        binary += String.fromCharCode(...bytes.subarray(offset, offset + 0x1000));
+      }
+      localStorage.setItem(`${SRAM_STORAGE_PREFIX}.${terminal}`, btoa(binary));
+    } catch {
+      // Storage can be unavailable in private contexts; the emulator remains usable.
+    }
+  }
+}
+
+function restoreTerminalMemory(machine: UA8295Machine, terminal: "a" | "b"): void {
+  try {
+    const encoded = localStorage.getItem(`${SRAM_STORAGE_PREFIX}.${terminal}`);
+    if (!encoded) return;
+    const binary = atob(encoded);
+    const length = Math.min(binary.length, machine.mainBus.xram.length);
+    for (let index = 0; index < length; index += 1) {
+      machine.mainBus.xram[index] = binary.charCodeAt(index) & 0xff;
+    }
+  } catch {
+    // Ignore corrupt or inaccessible saved memory and use clean emulated SRAM.
+  }
+}
+
 function attachGlobalKeyboard(): void {
   if (globalKeyboardAttached) return;
   globalKeyboardAttached = true;
   window.addEventListener("keydown", (event: KeyboardEvent) => {
     const key = PHYSICAL_KEY_MAP.get(event.key) ?? PHYSICAL_KEY_MAP.get(event.key.toLowerCase());
     if (!key || event.repeat || isTypingTarget(event.target)) return;
-    physicalKeysDown.set(event.code, key);
-    setKey(key, true);
+    const terminal = state.activeTerminal;
+    physicalKeysDown.set(event.code, { key, terminal });
+    setKey(key, true, terminal);
     event.preventDefault();
   });
   window.addEventListener("keyup", (event: KeyboardEvent) => {
-    const key = physicalKeysDown.get(event.code);
-    if (!key) return;
+    const pressed = physicalKeysDown.get(event.code);
+    if (!pressed) return;
     physicalKeysDown.delete(event.code);
-    setKey(key, false);
+    setKey(pressed.key, false, pressed.terminal);
     event.preventDefault();
   });
   window.addEventListener("blur", () => {
-    for (const key of new Set(physicalKeysDown.values())) setKey(key, false);
+    for (const pressed of physicalKeysDown.values()) setKey(pressed.key, false, pressed.terminal);
     physicalKeysDown.clear();
   });
 }
@@ -627,6 +687,40 @@ function renderSnapshot(snapshot: ReturnType<UA8295Machine["mainCpu"]["snapshot"
 function displayLine(snapshot: ReturnType<UA8295Machine["mainCpu"]["snapshot"]> | undefined): string {
   if (!snapshot) return "LOAD ROMS";
   return `${state.activeCpu.toUpperCase()} PC ${hex(snapshot.pc, 4)}  A ${hex(snapshot.a, 2)}`;
+}
+
+function machineFor(terminal: "a" | "b"): UA8295Machine | null {
+  return terminal === "a" ? state.machine : state.peerMachine;
+}
+
+function renderTerminal(machine: UA8295Machine | null, terminal: "a" | "b", label: string): string {
+  const displayText = machine?.hardware.display.displayLine() ?? displayLine(undefined);
+  const active = state.activeTerminal === terminal ? " is-active" : "";
+  return `
+    <section class="terminal-shell${active}" data-terminal="${terminal}">
+      <div class="terminal-heading">
+        <strong>${escapeHtml(label)}</strong>
+        ${state.appMode === "transmission" ? `<span>${terminal === "a" ? "Sender / receiver A" : "Sender / receiver B"}</span>` : ""}
+      </div>
+      <div class="device">
+        <div class="device-label">PHILIPS USFA UA-8295/00</div>
+        <div class="display-section">
+          <div class="display-bezel" data-terminal="${terminal}">${renderDisplay(displayText, machine?.hardware.display.brightnessLevel())}</div>
+          <div class="indicator-panel">
+            <div class="indicator-row">
+              <span>BATTERY LOW</span>
+              <span>CHARGE</span>
+              <span>MESSAGE</span>
+              <span class="${machine?.hardware.modemRadio.isTransmitting() ? "is-on" : ""}">TRANSMIT</span>
+            </div>
+            <div class="brand">PHILIPS<br>USFA B.V</div>
+          </div>
+        </div>
+        <div class="keyboard">${renderKeys(terminal)}</div>
+        ${state.uiMode === "developer" ? `<div class="keyboard-status">${machine?.hardware.keyboard.describe() ?? "Keyboard inactive"}</div><div class="display-details">${renderDisplayDetails(machine)}</div>` : ""}
+      </div>
+    </section>
+  `;
 }
 
 type KeyVariant =
@@ -724,18 +818,18 @@ const KEYBOARD_ROWS: KeySpec[][] = [
 
 const SIDE_COLUMN_KEYS: KeySpec[] = [
   { label: "ON OFF", lines: ["ON", "OFF"], binding: "ON_OFF", variant: "side" },
-  { label: "TIME BRIGHT", lines: ["TIME", "BRIGHT"], binding: "TIME", variant: "side" },
+  { label: "TIME BRIGHT", lines: ["TIME", "BRIGHT"], binding: "BRIGHT", variant: "side" },
   { label: "NEW KEY", lines: ["NEW", "KEY"], binding: "KEY", variant: "side" },
   { label: "CONF", binding: "CONF", variant: "side" },
   { label: "SHORT TERM", lines: ["SHORT", "TERM"], binding: "SHORT_TERM", variant: "side" }
 ];
 
-function renderKeys(): string {
+function renderKeys(terminal: "a" | "b"): string {
   const main = KEYBOARD_ROWS.map((row, idx) => {
-    const cells = row.map(renderKey).join("");
+    const cells = row.map((spec) => renderKey(spec, terminal)).join("");
     return `<div class="key-row keyboard-row-${idx + 1}">${cells}</div>`;
   }).join("");
-  const side = SIDE_COLUMN_KEYS.map(renderKey).join("");
+  const side = SIDE_COLUMN_KEYS.map((spec) => renderKey(spec, terminal)).join("");
   return `
     <div class="keypad">
       <div class="keypad-main" aria-label="Main keypad">${main}</div>
@@ -744,14 +838,14 @@ function renderKeys(): string {
   `;
 }
 
-function renderKey(spec: KeySpec): string {
+function renderKey(spec: KeySpec, terminal: "a" | "b"): string {
   const lines = spec.lines ?? [spec.label];
   const inner = lines.map((line) => `<span>${escapeHtml(line)}</span>`).join("");
   const isBound = Boolean(spec.binding && BINDABLE_KEYS.has(spec.binding));
   const stubClass = isBound ? "" : " is-stub";
   const variantClass = ` key-${spec.variant}`;
-  const dataKeyAttr = isBound ? ` data-key="${escapeHtml(spec.binding ?? "")}"` : "";
-  const isDisabled = !isBound || !state.machine;
+  const dataKeyAttr = isBound ? ` data-key="${escapeHtml(spec.binding ?? "")}" data-terminal="${terminal}"` : "";
+  const isDisabled = !isBound || !machineFor(terminal);
   const disabledAttr = isDisabled ? " disabled" : "";
   const ariaLabel = spec.ariaLabel ?? spec.label;
   const span = spec.span ?? 1;
@@ -759,7 +853,7 @@ function renderKey(spec: KeySpec): string {
   return `<button class="key${variantClass}${stubClass}"${dataKeyAttr}${styleAttr} aria-label="${escapeHtml(ariaLabel)}"${disabledAttr}>${inner}</button>`;
 }
 
-function renderDisplay(text: string): string {
+function renderDisplay(text: string, brightness = 0): string {
   const cells = text
     .slice(0, 32)
     .padEnd(32, " ")
@@ -770,11 +864,11 @@ function renderDisplay(text: string): string {
       return `<span class="display-cell${isBlank ? " is-blank" : ""}${isCursor ? " is-cursor" : ""}">${escapeHtml(char === " " ? "\u00a0" : char)}</span>`;
     })
     .join("");
-  return `<div class="display" aria-label="${escapeHtml(text)}">${cells}</div>`;
+  return `<div class="display brightness-${brightness}" aria-label="${escapeHtml(text)}">${cells}</div>`;
 }
 
-function renderDisplayDetails(): string {
-  const lines = state.machine?.hardware.display.detailLines() ?? ["Display inactive"];
+function renderDisplayDetails(machine: UA8295Machine | null = state.machine): string {
+  const lines = machine?.hardware.display.detailLines() ?? ["Display inactive"];
   return lines.map((line) => `<div>${line}</div>`).join("");
 }
 

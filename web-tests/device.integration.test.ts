@@ -100,7 +100,7 @@ describe("headless UA-8295 device workflow", () => {
       // Pressing a function key enters the deeper dispatcher at 0x080D from the
       // post-prompt wait loop at 0x0735, where the firmware writes the
       // currently-unmapped storage tag at XDATA 0x0000.
-      driver.pressAndWaitForDisplay("KEY", "PRIVATE ADDRESS:");
+      driver.pressAndWaitForDisplay("CONF", "PRIVATE ADDRESS:");
 
       const summary = driver.summary();
       expect(summary.hardwareGaps.some(([key]) => key.startsWith("main:external-control-latch:0x0000"))).toBe(true);

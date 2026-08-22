@@ -102,6 +102,28 @@ describe("browser MCS-51 core", () => {
     expect(cpu.snapshot().pc).toBeGreaterThanOrEqual(0x003e);
   });
 
+  it("restores a preempted low-priority ISR after high-priority RETI", () => {
+    const code = new Uint8Array(0x80);
+    code.set([0x02, 0x00, 0x40], 0x0000);
+    code.set([0x00, 0x00, 0x32], 0x000b); // high-priority Timer 0 ISR
+    code.set([0x00, 0x00, 0x00, 0x32], 0x001b); // low-priority Timer 1 ISR
+    code.set([
+      0x75, 0x89, 0x22, // both timers mode 2
+      0x75, 0x8c, 0xff, 0x75, 0x8a, 0xff,
+      0x75, 0x8d, 0xff, 0x75, 0x8b, 0xff,
+      0x75, 0xb8, 0x02, // Timer 0 high priority
+      0x75, 0xa8, 0x8a, // EA|ET0|ET1
+      0x75, 0x88, 0x50, // start both timers
+      0x80, 0xfe
+    ], 0x0040);
+    const cpu = new MCS51(new ExternalBus(code));
+
+    cpu.run(500);
+    // At an arbitrary instruction boundary either ISR may still be active,
+    // but nesting must stay bounded to low + one high-priority preemption.
+    expect(cpu.sp).toBeLessThanOrEqual(0x0b);
+  });
+
   it("halts on the undefined 0xA5 opcode", () => {
     const cpu = new MCS51(new ExternalBus(new Uint8Array([0xa5, 0x00])));
 
@@ -323,11 +345,11 @@ describe("authentic INT1 keyboard pipeline", () => {
       const driver = await HeadlessDeviceDriver.create({ traceAllXdata: false });
       driver.runCoupledBoot();
 
-      driver.pressKey("^");
+      driver.pressKey("SHORT_TERM");
       const { iramByte, readyBitObserved } = captureFirmwareLookup(driver);
 
       expect(readyBitObserved).toBe(true);
-      expect(iramByte).toBe(0x02);
+      expect(iramByte).toBe(0x0d);
     },
     20_000
   );
@@ -348,7 +370,7 @@ describe("authentic INT1 keyboard pipeline", () => {
   );
 
   it(
-    "firmware lookup produces correct byte for DEL and runs the cancel handler",
+    "firmware lookup produces the character-erase byte for DEL",
     async () => {
       const driver = await HeadlessDeviceDriver.create({ traceAllXdata: false });
       driver.runCoupledBoot();
@@ -357,12 +379,7 @@ describe("authentic INT1 keyboard pipeline", () => {
       const { iramByte, readyBitObserved } = captureFirmwareLookup(driver);
 
       expect(readyBitObserved).toBe(true);
-      expect(iramByte).toBe(0x03);
-
-      // Within a few additional slices the idle dispatcher at 0x058D consumes
-      // 0x03 → cancel branch and the firmware redraws "GIVE NUMBER OR FUNCTION?".
-      driver.runSchedulerSlices(400, 80);
-      expect(driver.displayText()).toContain("GIVE NUMBER OR FUNCTION?");
+      expect(iramByte).toBe(0x5f);
     },
     20_000
   );
@@ -373,7 +390,7 @@ describe("authentic INT1 keyboard pipeline", () => {
       const driver = await HeadlessDeviceDriver.create({ traceAllXdata: false });
       driver.runCoupledBoot();
 
-      driver.pressKey("^");
+      driver.pressKey("SHORT_TERM");
       driver.runSchedulerSlices(40, 80);
 
       const strobes = driver.machine.hardware.keyboardScan.recentStrobes();
@@ -390,9 +407,9 @@ describe("authentic INT1 keyboard pipeline", () => {
       const driver = await HeadlessDeviceDriver.create({ traceAllXdata: false });
       driver.runCoupledBoot();
 
-      driver.pressKey("^");
+      driver.pressKey("SHORT_TERM");
       driver.runSchedulerSlices(40, 80);
-      expect(driver.machine.mainCpu.iram[0x1c]).toBe(0x02);
+      expect(driver.machine.mainCpu.iram[0x1c]).toBe(0x0d);
 
       // Stash a marker into iram[0x1C] so we can detect a re-arm. The firmware will
       // overwrite it via the lookup at 0x044A only if INT1 fires again.
@@ -400,11 +417,11 @@ describe("authentic INT1 keyboard pipeline", () => {
       driver.runSchedulerSlices(120, 80);
       expect(driver.machine.mainCpu.iram[0x1c]).toBe(0xa5);
 
-      driver.releaseKey("^");
+      driver.releaseKey("SHORT_TERM");
       driver.runSchedulerSlices(40, 80);
-      driver.pressKey("^");
+      driver.pressKey("SHORT_TERM");
       driver.runSchedulerSlices(80, 80);
-      expect(driver.machine.mainCpu.iram[0x1c]).toBe(0x02);
+      expect(driver.machine.mainCpu.iram[0x1c]).toBe(0x0d);
     },
     20_000
   );
@@ -455,7 +472,7 @@ describe("authentic INT1 keyboard pipeline", () => {
   );
 
   it(
-    "produces CR for the = key",
+    "produces the slash/accept byte for the = key",
     async () => {
       const driver = await HeadlessDeviceDriver.create({ traceAllXdata: false });
       driver.runCoupledBoot();
@@ -464,31 +481,31 @@ describe("authentic INT1 keyboard pipeline", () => {
       const { iramByte, readyBitObserved } = captureFirmwareLookup(driver);
 
       expect(readyBitObserved).toBe(true);
-      expect(iramByte).toBe(0x0d);
+      expect(iramByte).toBe(0x2f);
     },
     20_000
   );
 
   it(
-    "SHIFT modifier produces the shifted byte (^+TIME → BRIGHT 0x8E)",
+    "SHIFT modifier produces the shifted byte (^+BRIGHT → TIME 0x9C)",
     async () => {
       const driver = await HeadlessDeviceDriver.create({ traceAllXdata: false });
       driver.runCoupledBoot();
 
-      // Press SHIFT first, then TIME, so updateKeyboardScan sees both held when
+      // Press SHIFT first, then BRIGHT, so updateKeyboardScan sees both held when
       // it next services the scan controller.
       driver.pressKey("^");
-      driver.pressKey("TIME");
+      driver.pressKey("BRIGHT");
       const { iramByte, readyBitObserved } = captureFirmwareLookup(driver);
 
       expect(readyBitObserved).toBe(true);
-      expect(iramByte).toBe(0x8e);
+      expect(iramByte).toBe(0x9c);
     },
     20_000
   );
 
   it(
-    "SHIFT held alone still produces cancel (raw 0x00 → byte 0x02)",
+    "SHIFT held alone remains a modifier and does not arm a scan",
     async () => {
       const driver = await HeadlessDeviceDriver.create({ traceAllXdata: false });
       driver.runCoupledBoot();
@@ -496,8 +513,8 @@ describe("authentic INT1 keyboard pipeline", () => {
       driver.pressKey("^");
       const { iramByte, readyBitObserved } = captureFirmwareLookup(driver);
 
-      expect(readyBitObserved).toBe(true);
-      expect(iramByte).toBe(0x02);
+      expect(readyBitObserved).toBe(false);
+      expect(iramByte).toBe(0x00);
     },
     20_000
   );
@@ -520,5 +537,5 @@ describe("authentic INT1 keyboard pipeline", () => {
     20_000
   );
 
-  it.todo("ON_OFF / SCROLL_LEFT / SCROLL_RIGHT exercise no firmware path yet (no scan code)");
+  it.todo("ON_OFF exercises the electrical power path rather than a firmware scan code");
 });
