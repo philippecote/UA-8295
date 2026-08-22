@@ -28,7 +28,7 @@ Status meanings:
 | 2.11 | Off-line encryption/decryption | Not tested | Add plaintext/ciphertext round-trip with and without printer output. |
 | 2.12 | Delete all memory | Pass | The installed-ROM `SHIFT+T`, `SHIFT+K` confirmation prompt and zeroing of all persistent message, configuration, and key SRAM are asserted; only the live display workspace is subsequently rewritten. |
 | 2.13 | Manual ACK/NAK | Partial | NAK entry prompt works; complete linked-terminal ACK and NAK delivery remain. |
-| 2.14 | Changing the key | Partial | KEY entry prompt works; keyword replacement, ID change, and persistence remain. |
+| 2.14 | Changing the key | Pass | DAY'S KEY selection, NEW KEY keyword entry, deterministic four-character ID generation, SRAM encoding, and persistence across reset are asserted. |
 | 2.15 | Printer | Boundary | Serial printer input, output, control characters, and auto-print behavior need a peripheral model. |
 | 2.16 | External computer | Boundary | Computer-port protocol and modem command boundary are not yet decoded. |
 | 3.1-3.8 | Error conditions | Not tested | Add deterministic fault injection and recovery for each documented condition. |

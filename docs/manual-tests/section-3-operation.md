@@ -307,10 +307,24 @@ promoted to `status: "pass"` and retained as regression coverage.
   "id": "M3-2.14-CHANGE-KEY",
   "manualSection": "3.2.14",
   "title": "A new keyword changes the displayed four-character key ID",
-  "status": "todo",
-  "reason": "KEY display works; keyword entry and persistence are not covered",
-  "steps": [{ "pressShifted": "KEY" }],
-  "expectDisplay": "KEY"
+  "status": "pass",
+  "steps": [
+    { "press": "CONF" },
+    { "press": "=" },
+    { "press": "=" },
+    { "press": "=" },
+    { "press": "=" },
+    { "press": "DEL" },
+    { "press": "SHORT_TERM" },
+    { "pressShifted": "KEY", "expectDisplay": "NEW KEY:" },
+    { "press": "A" },
+    { "press": "L" },
+    { "press": "P" },
+    { "press": "H" },
+    { "press": "A" },
+    { "press": "=", "settleSlices": 1200 }
+  ],
+  "expectDisplay": "KEY: AIEH"
 }
 ```
 
