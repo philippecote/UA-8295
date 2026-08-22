@@ -115,4 +115,13 @@ describe("Device Mode UI smoke coverage", () => {
     expect(app).toContain('binding: "ACK_NAK"');
     expect(app).not.toMatch(/ACK NAK[^}]*binding: "RCV"/);
   });
+
+  it("routes the host spacebar without also activating the last clicked device key", async () => {
+    const app = await readFile("src/app.ts", "utf8");
+
+    expect(app).toContain('[" ", "SPACE"]');
+    expect(app).toContain('["Spacebar", "SPACE"]');
+    expect(app).toContain('event.target.closest("[data-key]")');
+    expect(app).toContain("button.blur()");
+  });
 });

@@ -64,6 +64,7 @@ const PHYSICAL_KEY_MAP = new Map<string, FrontPanelKey>([
   ["Shift", "^"],
   ["Enter", "="],
   [" ", "SPACE"],
+  ["Spacebar", "SPACE"],
   ["ArrowLeft", "SCROLL_LEFT"],
   ["ArrowRight", "SCROLL_RIGHT"],
   [",", ","],
@@ -309,7 +310,13 @@ function render(): void {
       state.activeTerminal = terminal;
       setKey(key, true, terminal);
     });
-    button.addEventListener("pointerup", () => setKey(key, false, terminal));
+    button.addEventListener("pointerup", () => {
+      setKey(key, false, terminal);
+      // Pointer-operated keys should not retain browser focus: otherwise the
+      // next physical Space press activates that focused button as well as the
+      // terminal's SPACE key.
+      button.blur();
+    });
     button.addEventListener("pointercancel", () => setKey(key, false, terminal));
     button.addEventListener("pointerleave", () => setKey(key, false, terminal));
     button.addEventListener("keydown", (event) => {
@@ -638,6 +645,9 @@ function attachGlobalKeyboard(): void {
   if (globalKeyboardAttached) return;
   globalKeyboardAttached = true;
   window.addEventListener("keydown", (event: KeyboardEvent) => {
+    if ((event.key === " " || event.key === "Enter") && event.target instanceof Element && event.target.closest("[data-key]")) {
+      return;
+    }
     const key = PHYSICAL_KEY_MAP.get(event.key) ?? PHYSICAL_KEY_MAP.get(event.key.toLowerCase());
     if (!key || event.repeat || isTypingTarget(event.target)) return;
     const terminal = state.activeTerminal;
