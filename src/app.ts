@@ -8,6 +8,7 @@ import { UA8295LinkedPair } from "./radio-link";
 import { loadBundledRomSet, loadRomSetFromFiles, ROM_SPECS, type RomSet } from "./roms";
 import { UA8295Machine } from "./ua8295";
 import { formatTraceEvent, summarizeTraceEvents, type CpuName, type TraceEventKind } from "./trace";
+import { decodeTerminalMemory, encodeTerminalMemory, SRAM_STORAGE_PREFIX } from "./sram-persistence";
 
 const state: {
   roms: RomSet | null;
@@ -49,7 +50,6 @@ const app = appElement;
 let animationHandle: number | null = null;
 let continuousFrameCount = 0;
 let globalKeyboardAttached = false;
-const SRAM_STORAGE_PREFIX = "ua8295.sram.v1";
 const physicalKeysDown = new Map<string, { key: FrontPanelKey; terminal: "a" | "b" }>();
 // Maps host-keyboard codes (event.key, event.code) to FrontPanelKey targets. The
 // real device keyboard is uppercase-only, so a-z host keys all route to the
@@ -616,12 +616,7 @@ function persistTerminalMemory(): void {
     const machine = machineFor(terminal);
     if (!machine) continue;
     try {
-      const bytes = machine.mainBus.xram;
-      let binary = "";
-      for (let offset = 0; offset < bytes.length; offset += 0x1000) {
-        binary += String.fromCharCode(...bytes.subarray(offset, offset + 0x1000));
-      }
-      localStorage.setItem(`${SRAM_STORAGE_PREFIX}.${terminal}`, btoa(binary));
+      localStorage.setItem(`${SRAM_STORAGE_PREFIX}.${terminal}`, encodeTerminalMemory(machine.mainBus.xram));
     } catch {
       // Storage can be unavailable in private contexts; the emulator remains usable.
     }
@@ -632,11 +627,8 @@ function restoreTerminalMemory(machine: UA8295Machine, terminal: "a" | "b"): voi
   try {
     const encoded = localStorage.getItem(`${SRAM_STORAGE_PREFIX}.${terminal}`);
     if (!encoded) return;
-    const binary = atob(encoded);
-    const length = Math.min(binary.length, machine.mainBus.xram.length);
-    for (let index = 0; index < length; index += 1) {
-      machine.mainBus.xram[index] = binary.charCodeAt(index) & 0xff;
-    }
+    const restored = decodeTerminalMemory(encoded, machine.mainBus.xram.length);
+    if (restored) machine.mainBus.xram.set(restored);
   } catch {
     // Ignore corrupt or inaccessible saved memory and use clean emulated SRAM.
   }
