@@ -4,6 +4,22 @@ import { UA8295Machine } from "../src/ua8295";
 import { loadTestRomSet } from "./device-driver";
 
 describe("UA-8295 terminal radio link", () => {
+  it("derives the MESSAGE indicator from unread receive-directory records", async () => {
+    const roms = await loadTestRomSet();
+    const machine = new UA8295Machine(roms);
+
+    expect(machine.receiveMessageIndicatorLit()).toBe(false);
+    machine.mainBus.xram[1] = 0x26;
+    machine.mainBus.xram[2] = 0x00;
+    machine.mainBus.xram[3] = 0xfe;
+    expect(machine.receiveMessageIndicatorLit()).toBe(true);
+    machine.mainBus.xram[2] = 0x0c;
+    expect(machine.receiveMessageIndicatorLit()).toBe(false);
+    machine.mainBus.xram[4] = 0x40;
+    machine.mainBus.xram[5] = 0x00;
+    expect(machine.receiveMessageIndicatorLit()).toBe(true);
+  });
+
   it("carries the IOP transmit waveform to the peer receive pin and detects collisions", async () => {
     const roms = await loadTestRomSet();
     const left = new UA8295Machine(roms);

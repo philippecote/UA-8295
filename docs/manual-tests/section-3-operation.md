@@ -294,7 +294,7 @@ promoted to `status: "pass"` and retained as regression coverage.
   "manualSection": "3.2.13",
   "title": "Manual ACK and NAK reach the original transmitting terminal",
   "status": "todo",
-  "reason": "Entry prompt works; paired acknowledgement delivery is not covered",
+  "reason": "Automatic ACK now round-trips; manual ACK/NAK packets transmit but the original sender response remains unverified",
   "steps": [{ "press": "ACK_NAK" }],
   "expectDisplay": "ACKNOWLEDGED"
 }

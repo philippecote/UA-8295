@@ -22,9 +22,9 @@ Status meanings:
 | 2.6A | Free-format composition | Pass | TERM exits composition; both answers to the existing-message prompt, whole-message deletion, and independent small-memory composition are asserted through SRAM. |
 | 2.6B | Fixed-format composition | Pass | Both installed formats complete all prompted fields through the original text ROM; selectors 3-9 are verified as `NOT DEFINED`. |
 | 2.7 | Editing | Pass | Character erase/replacement, scrolling, held-key repeat, shifted BEGIN/END, long-message viewport movement, and `=` line breaks run through the ROM. |
-| 2.8 | Transmission | Partial | Broadcast free-format A-to-B succeeds; address changes, small memory, indicators, printout, and acknowledgement remain. |
-| 2.9 | Reception | Partial | One valid message is stored and decoded; filtering, full memory, clock/data errors, alarm, and acknowledgement remain. |
-| 2.10 | Display received messages | Partial | Empty state and one received message work; headers, iteration, deletion, fixed formats, and indicators remain. |
+| 2.8 | Transmission | Pass | Large and small memories, retained and changed receiver addresses, the transmit indicator, broadcast and addressed delivery, `SENT`, and automatic `ACKNOWLEDGED` are asserted; printer output remains the 2.15 boundary. |
+| 2.9 | Reception | Partial | Address filtering, encrypted storage, automatic acknowledgement, and the MESSAGE indicator pass; full-memory, clock/data-error, and sound-alarm cases remain. |
+| 2.10 | Display received messages | Partial | Empty state, sender/time headers, free-text bodies, multi-message iteration, read-indicator clearing, and deletion pass; received fixed formats and printer output remain. |
 | 2.11 | Off-line encryption/decryption | Not tested | Add plaintext/ciphertext round-trip with and without printer output. |
 | 2.12 | Delete all memory | Not tested | Verify confirmation phrase and zeroing of messages, configuration, and key material. |
 | 2.13 | Manual ACK/NAK | Partial | NAK entry prompt works; complete linked-terminal ACK and NAK delivery remain. |

@@ -848,7 +848,7 @@ export class UA8295Hardware implements CpuHardwareHooks {
       return;
     }
 
-    // SHIFT (`^`) is only a modifier; TERM is the raw 0x00 control key.
+    // SHIFT (`^`) is only a modifier; TERM has its own raw 0x0B control code.
     const shiftHeld = this.keyboard.isShiftHeld();
     // Any physical key wakes the display, including SHIFT by itself and keys
     // handled entirely in hardware rather than by the ROM scan pipeline.

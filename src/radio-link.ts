@@ -19,6 +19,8 @@ export class UA8295RadioLink {
   private rightSerialCursor = 0;
   private leftProtocolTxActive = false;
   private rightProtocolTxActive = false;
+  private leftProtocolPayloadBytes = 0;
+  private rightProtocolPayloadBytes = 0;
 
   constructor(
     readonly left: UA8295Machine,
@@ -30,7 +32,15 @@ export class UA8295RadioLink {
     const rightRadio = this.right.hardware.modemRadio;
     const leftTx = leftRadio.isTransmitting();
     const rightTx = rightRadio.isTransmitting();
-    this.collision = leftTx && rightTx;
+    const protocolOverlap = this.leftProtocolTxActive && this.rightProtocolTxActive;
+    const simultaneousProtocolStart =
+      protocolOverlap && this.leftProtocolPayloadBytes === 0 && this.rightProtocolPayloadBytes === 0;
+    const directPortOverlap = !this.leftProtocolTxActive && !this.rightProtocolTxActive;
+    // An automatic acknowledgement can start while the sender's analog
+    // waveform tail is still keyed. Once the sender has emitted its protocol
+    // terminator that is a valid turnaround, not a collision. Raw simultaneous
+    // port-keying (used by the hardware-level model) remains a collision.
+    this.collision = leftTx && rightTx && (simultaneousProtocolStart || directPortOverlap);
     leftRadio.setInput(rightTx && !this.collision, rightRadio.transmitMark());
     rightRadio.setInput(leftTx && !this.collision, leftRadio.transmitMark());
     this.bridgeRecoveredBytes(this.left, this.right, "left");
@@ -41,17 +51,32 @@ export class UA8295RadioLink {
     const transfers = source.hardware.serial.recentTransfers();
     let cursor = side === "left" ? this.leftSerialCursor : this.rightSerialCursor;
     let active = side === "left" ? this.leftProtocolTxActive : this.rightProtocolTxActive;
+    let payloadBytes = side === "left" ? this.leftProtocolPayloadBytes : this.rightProtocolPayloadBytes;
     for (const transfer of transfers) {
       if (transfer.sequence <= cursor) continue;
+      const startsPacket = transfer.source === "main" && transfer.rb8 && (transfer.value & 0x80) !== 0;
+      const peerPayloadBytes = side === "left" ? this.rightProtocolPayloadBytes : this.leftProtocolPayloadBytes;
+      // Preserve an automatic ACK in the recovered-byte buffer until the
+      // original sender has physically released transmit. Real modem
+      // turnaround supplies this guard time; without it the carrier edge can
+      // reach the sender ROM while it is still switching to receive mode.
+      if (startsPacket && peer.hardware.modemRadio.isTransmitting() && peerPayloadBytes > 0) break;
       cursor = transfer.sequence;
       // The real modem's carrier/framing detector reports 0x40 to the main
       // CPU before received payload bytes. The analog detector is outside the
       // ROMs; synthesize that edge when the peer accepts a transmit command
       // (0x8x), then deliver the front-end's recovered encrypted octets below.
-      if (transfer.source === "main" && transfer.rb8 && (transfer.value & 0x80) !== 0) {
+      if (startsPacket) {
         active = true;
+        payloadBytes = 0;
         if (!this.collision) peer.mainCpu.receiveSerial(0x40, true);
+      } else if (active && transfer.source === "main" && transfer.rb8) {
+        // The main CPU closes a modem transaction with an unshifted control
+        // command (normally 0x02, followed by 0x01).
+        active = false;
       } else if (active && transfer.source === "main" && !transfer.rb8 && transfer.value === 0xff) {
+        // 0xFF is the modem packet terminator, not part of the recovered
+        // encrypted payload presented to the peer main CPU.
         active = false;
       } else if (active && transfer.source === "main" && !transfer.rb8 && !this.collision) {
         // The demodulator returns the encrypted over-the-air octets unchanged;
@@ -59,14 +84,17 @@ export class UA8295RadioLink {
         // receive path. Framing, checksum, decryption, address filtering and
         // message storage remain original main-ROM behavior.
         peer.mainCpu.receiveSerial(transfer.value, false);
+        payloadBytes += 1;
       }
     }
     if (side === "left") {
       this.leftSerialCursor = cursor;
       this.leftProtocolTxActive = active;
+      this.leftProtocolPayloadBytes = payloadBytes;
     } else {
       this.rightSerialCursor = cursor;
       this.rightProtocolTxActive = active;
+      this.rightProtocolPayloadBytes = payloadBytes;
     }
   }
 

@@ -710,7 +710,7 @@ function renderTerminal(machine: UA8295Machine | null, terminal: "a" | "b", labe
             <div class="indicator-row">
               <span>BATTERY LOW</span>
               <span>CHARGE</span>
-              <span>MESSAGE</span>
+              <span class="${machine?.receiveMessageIndicatorLit() ? "is-on" : ""}">MESSAGE</span>
               <span class="${machine?.hardware.modemRadio.isTransmitting() ? "is-on" : ""}">TRANSMIT</span>
             </div>
             <div class="brand">PHILIPS<br>USFA B.V</div>

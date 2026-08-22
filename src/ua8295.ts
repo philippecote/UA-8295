@@ -71,6 +71,25 @@ export class UA8295Machine {
     return name === "main" ? this.mainCpu : this.iopCpu;
   }
 
+  /**
+   * The receive-memory directory stores up to eight variable-length records.
+   * Each record starts with its type byte and is terminated by 0xFE; bit 2 of
+   * the following status byte is set after the operator has displayed the
+   * complete body. This is the firmware state that drives the MESSAGE lamp.
+   */
+  receiveMessageIndicatorLit(): boolean {
+    let recordOffset = 1;
+    for (let message = 0; message < 8; message += 1) {
+      if (this.mainBus.xram[recordOffset] === 0x00 || this.mainBus.xram[recordOffset] === 0xff) return false;
+      if ((this.mainBus.xram[recordOffset + 1] & 0x04) === 0) return true;
+      while (recordOffset < this.mainBus.xram.length && this.mainBus.xram[recordOffset] !== 0xfe) {
+        recordOffset += 1;
+      }
+      recordOffset += 1;
+    }
+    return false;
+  }
+
   reset(): void {
     this.mainCpu.reset();
     this.iopCpu.reset();
