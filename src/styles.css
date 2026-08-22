@@ -198,7 +198,10 @@ h1 {
   border-color: #2f3622;
   border-radius: 18px;
   color: #1d231a;
+  margin-inline: auto;
+  max-width: 100%;
   padding: 1.6rem;
+  width: fit-content;
   /* The chassis renders at its photo-grade natural width; allow horizontal scroll on
      narrow viewports rather than mangling the keyboard geometry. */
   overflow-x: auto;

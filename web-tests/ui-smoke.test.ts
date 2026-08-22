@@ -35,6 +35,7 @@ describe("Device Mode UI smoke coverage", () => {
     expect(app).toContain('app.classList.toggle("is-transmission-mode", state.appMode === "transmission")');
     expect(styles).toMatch(/#app\s*{[^}]*max-width:\s*1180px/s);
     expect(styles).toMatch(/#app\.is-transmission-mode\s*{[^}]*max-width:\s*1760px/s);
+    expect(styles).toMatch(/\.device\s*{[^}]*max-width:\s*100%[^}]*width:\s*fit-content/s);
   });
 
   it("describes the QWERTY chassis layout in CSS and source", async () => {
