@@ -6,6 +6,11 @@ export interface LinkedRunResult {
   right: { main: TraceEntry[]; iop: TraceEntry[] };
 }
 
+export interface RadioDeliveryStats {
+  leftToRight: { packets: number; payloadBytes: number };
+  rightToLeft: { packets: number; payloadBytes: number };
+}
+
 /**
  * A radio channel between two complete UA-8295 terminals. It carries the raw
  * IOP waveform and models the external analog front-end's framing/recovered
@@ -21,6 +26,10 @@ export class UA8295RadioLink {
   private rightProtocolTxActive = false;
   private leftProtocolPayloadBytes = 0;
   private rightProtocolPayloadBytes = 0;
+  private leftDeliveredPackets = 0;
+  private rightDeliveredPackets = 0;
+  private leftDeliveredPayloadBytes = 0;
+  private rightDeliveredPayloadBytes = 0;
 
   constructor(
     readonly left: UA8295Machine,
@@ -69,7 +78,11 @@ export class UA8295RadioLink {
       if (startsPacket) {
         active = true;
         payloadBytes = 0;
-        if (!this.collision) peer.mainCpu.receiveSerial(0x40, true);
+        if (!this.collision) {
+          peer.mainCpu.receiveSerial(0x40, true);
+          if (side === "left") this.leftDeliveredPackets += 1;
+          else this.rightDeliveredPackets += 1;
+        }
       } else if (active && transfer.source === "main" && transfer.rb8) {
         // The main CPU closes a modem transaction with an unshifted control
         // command (normally 0x02, followed by 0x01).
@@ -85,6 +98,8 @@ export class UA8295RadioLink {
         // message storage remain original main-ROM behavior.
         peer.mainCpu.receiveSerial(transfer.value, false);
         payloadBytes += 1;
+        if (side === "left") this.leftDeliveredPayloadBytes += 1;
+        else this.rightDeliveredPayloadBytes += 1;
       }
     }
     if (side === "left") {
@@ -103,6 +118,19 @@ export class UA8295RadioLink {
     if (this.left.hardware.modemRadio.isTransmitting()) return "terminal A transmitting";
     if (this.right.hardware.modemRadio.isTransmitting()) return "terminal B transmitting";
     return "connected";
+  }
+
+  deliveryStats(): RadioDeliveryStats {
+    return {
+      leftToRight: {
+        packets: this.leftDeliveredPackets,
+        payloadBytes: this.leftDeliveredPayloadBytes
+      },
+      rightToLeft: {
+        packets: this.rightDeliveredPackets,
+        payloadBytes: this.rightDeliveredPayloadBytes
+      }
+    };
   }
 }
 

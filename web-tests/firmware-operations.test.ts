@@ -148,3 +148,38 @@ describe("manual sections 3.2.8-3.2.10 linked operations", () => {
   }, 60_000);
 
 });
+
+describe("manual section 3.2.13 addressed responses", () => {
+  it("transmits manual ACK and NAK packets to the addressed peer UART", async () => {
+    const context = await createLinkedContext();
+    configurePrivateAddress(context, context.left, "34");
+    configurePrivateAddress(context, context.right, "12");
+
+    const transmitResponse = (shifted: boolean, prompt: string): void => {
+      const before = context.pair.link.deliveryStats().rightToLeft;
+      context.press(context.right, "ACK_NAK", shifted);
+      expect(context.right.hardware.display.displayLine()).toContain(prompt);
+      context.press(context.right, "3");
+      context.press(context.right, "4");
+      context.press(context.right, "=");
+
+      let sawTransmit = false;
+      for (let chunk = 0; chunk < 8_000; chunk += 1) {
+        context.run(10, 40);
+        sawTransmit ||= context.right.hardware.modemRadio.isTransmitting();
+        const delivered = context.pair.link.deliveryStats().rightToLeft;
+        if (sawTransmit && delivered.packets > before.packets &&
+            !context.right.hardware.modemRadio.isTransmitting()) break;
+      }
+      context.run(300, 40);
+
+      const after = context.pair.link.deliveryStats().rightToLeft;
+      expect(sawTransmit).toBe(true);
+      expect(after.packets).toBe(before.packets + 1);
+      expect(after.payloadBytes).toBeGreaterThan(before.payloadBytes);
+    };
+
+    transmitResponse(true, "ACK TO STATION:");
+    transmitResponse(false, "NAK TO STATION:");
+  }, 60_000);
+});

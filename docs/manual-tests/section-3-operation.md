@@ -330,7 +330,7 @@ promoted to `status: "pass"` and retained as regression coverage.
   "manualSection": "3.2.13",
   "title": "Manual ACK and NAK reach the original transmitting terminal",
   "status": "todo",
-  "reason": "Automatic ACK now round-trips; manual ACK/NAK packets transmit but the original sender response remains unverified",
+  "reason": "Manual ACK and NAK packets reach the peer UART, but a late response on the original sender's operator display remains unverified",
   "steps": [{ "press": "ACK_NAK" }],
   "expectDisplay": "ACKNOWLEDGED"
 }
