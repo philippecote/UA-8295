@@ -879,6 +879,9 @@ export class UA8295Hardware implements CpuHardwareHooks {
 
 export function displayCharacter(byte: number): string {
   const value = byte & 0xff;
+  // The terminal's custom display font uses 0x1E for its upward-arrow SHIFT
+  // glyph. Represent it with the front-panel/manual caret in plain text.
+  if (value === 0x1e) return "^";
   if (value >= 1 && value <= 26) return String.fromCharCode(0x40 + value);
   if (value >= 0x20 && value <= 0x7e) return String.fromCharCode(value);
   return ".";

@@ -278,8 +278,10 @@ describe("browser MCS-51 core", () => {
       machine.mainBus.writeXdata(0x7fe0 + index, char.charCodeAt(0));
       machine.hardware.writeXdata("main", 0x7fe0 + index, char.charCodeAt(0), "xram");
     }
+    machine.mainBus.writeXdata(0x7fe0 + text.length, 0x1e);
+    machine.hardware.writeXdata("main", 0x7fe0 + text.length, 0x1e, "xram");
 
-    expect(machine.hardware.display.displayLine().startsWith(text)).toBe(true);
+    expect(machine.hardware.display.displayLine().startsWith(`${text}^`)).toBe(true);
     expect(machine.hardware.display.textSnapshot().slice(0, 5)).toEqual([72, 69, 76, 76, 79]);
   });
 

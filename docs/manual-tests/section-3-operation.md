@@ -281,10 +281,12 @@ promoted to `status: "pass"` and retained as regression coverage.
   "id": "M3-2.12-DELETE-MEMORY",
   "manualSection": "3.2.12",
   "title": "The confirmation chord clears messages, configuration, and key material",
-  "status": "todo",
-  "reason": "The manual's two shifted-letter confirmation sequence is not decoded",
-  "steps": [],
-  "expectDisplay": "DELETE THE MEMORY"
+  "status": "pass",
+  "steps": [
+    { "pressShifted": "T", "expectDisplay": "GIVE ^K TO CLEAR THE MEMORY" },
+    { "pressShifted": "K" }
+  ],
+  "expectDisplay": "GIVE ^K TO CLEAR THE MEMORY"
 }
 ```
 
