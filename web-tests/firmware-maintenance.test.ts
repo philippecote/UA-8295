@@ -71,3 +71,37 @@ describe("manual section 3.2.14 key replacement", () => {
     expect(driver.displayText()).toContain("KEY: AIEH");
   }, 30_000);
 });
+
+describe("manual section 3.2.11 offline cryptography", () => {
+  it("encrypts displayed plaintext in five-letter groups and decrypts edited ciphertext", async () => {
+    const driver = await HeadlessDeviceDriver.create({ traceAllXdata: false });
+    driver.runCoupledBoot();
+    press(driver, "CONF", true);
+    press(driver, "SHORT_TERM");
+    composeFreeMessage(driver, "HELLO");
+    press(driver, "0");
+    expect(driver.displayText()).toContain("*HELLO");
+
+    press(driver, "ENCR", true);
+    expect(driver.displayText()).toContain("PRINTER OUTPUT (Y/N)?");
+    press(driver, "N");
+    driver.runSchedulerSlices(1_200);
+    expect(driver.displayText()).toContain("LHGCC OHMKP MCBKA");
+
+    // The second left-arrow press returns from the transient encrypted view to
+    // the editable source buffer. Replace it with the grouped ciphertext so
+    // the physical lower DECR legend can exercise the inverse path.
+    press(driver, "SCROLL_LEFT");
+    press(driver, "SCROLL_LEFT");
+    press(driver, "DEL", true);
+    for (const character of "LHGCC OHMKP MCBKA") {
+      press(driver, character === " " ? "SPACE" : character as FrontPanelKey);
+    }
+
+    press(driver, "ENCR");
+    expect(driver.displayText()).toContain("PRINTER OUTPUT (Y/N)?");
+    press(driver, "N");
+    driver.runSchedulerSlices(1_200);
+    expect(driver.displayText()).toContain("HELLO.");
+  }, 30_000);
+});

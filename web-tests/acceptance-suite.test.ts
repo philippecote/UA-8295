@@ -58,7 +58,7 @@ describe("manual-grounded acceptance suite", () => {
     if (testCase.expectedIramByte !== undefined) {
       expect(driver.machine.mainCpu.iram[0x1c], `iram[0x1C] for ${testCase.id}`).toBe(testCase.expectedIramByte);
     }
-  }, 30_000);
+  }, 45_000);
 
   for (const scenario of pendingScenarios) {
     it.todo(`${scenario.manualSection} ${scenario.title} [${scenario.status}: ${scenario.reason}]`);

@@ -25,7 +25,7 @@ Status meanings:
 | 2.8 | Transmission | Pass | Large and small memories, retained and changed receiver addresses, the transmit indicator, broadcast and addressed delivery, `SENT`, and automatic `ACKNOWLEDGED` are asserted; printer output remains the 2.15 boundary. |
 | 2.9 | Reception | Partial | Address filtering, encrypted storage, automatic acknowledgement, and the MESSAGE indicator pass; full-memory, clock/data-error, and sound-alarm cases remain. |
 | 2.10 | Display received messages | Partial | Empty state, sender/time headers, free-text bodies, multi-message iteration, read-indicator clearing, and deletion pass; received fixed formats and printer output remain. |
-| 2.11 | Off-line encryption/decryption | Not tested | Add plaintext/ciphertext round-trip with and without printer output. |
+| 2.11 | Off-line encryption/decryption | Partial | The no-printer path round-trips displayed `HELLO` through deterministic five-letter ciphertext groups and edited ciphertext back to plaintext; printer output remains the 2.15 boundary. |
 | 2.12 | Delete all memory | Pass | The installed-ROM `SHIFT+T`, `SHIFT+K` confirmation prompt and zeroing of all persistent message, configuration, and key SRAM are asserted; only the live display workspace is subsequently rewritten. |
 | 2.13 | Manual ACK/NAK | Partial | NAK entry prompt works; complete linked-terminal ACK and NAK delivery remain. |
 | 2.14 | Changing the key | Pass | DAY'S KEY selection, NEW KEY keyword entry, deterministic four-character ID generation, SRAM encoding, and persistence across reset are asserted. |
