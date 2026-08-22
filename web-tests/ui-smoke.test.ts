@@ -12,6 +12,7 @@ describe("Device Mode UI smoke coverage", () => {
     expect(styles).toContain(".display-cell");
     expect(styles).toContain(".device-label");
     expect(styles).toContain("touch-action: none");
+    expect(app).toContain('class="case-lid"');
   });
 
   it("renders the photo-accurate LED indicator labels", async () => {
@@ -47,12 +48,24 @@ describe("Device Mode UI smoke coverage", () => {
     expect(styles).toContain(".key-row");
     expect(styles).toContain(".fn-column");
     expect(styles).toContain(".key.is-stub");
+    expect(styles).toContain(".keyboard-row-5 > :nth-child(2)");
+    expect(styles).toMatch(/\.keyboard-row-2[^}]*translate/s);
+    expect(styles).toMatch(/\.keyboard-row-3[^}]*translate/s);
 
     // Per-row classes the renderer emits (keyboard-row-1..5).
     expect(app).toContain("keyboard-row-${idx + 1}");
     for (let i = 1; i <= 5; i += 1) {
       expect(styles).toMatch(new RegExp(`keyboard-row-${i}|key-row`));
     }
+  });
+
+  it("uses the photographed symbolic legends without changing firmware bindings", async () => {
+    const app = await readFile("src/app.ts", "utf8");
+
+    expect(app).toContain('lines: ["DELETE", "⌫"]');
+    expect(app).toContain('lines: ["▭", "↑"]');
+    expect(app).toContain('label: "=", lines: ["≡"], binding: "="');
+    expect(app).toContain('lines: ["↔"]');
   });
 
   it("declares all photo-grade key legends in the chassis source", async () => {

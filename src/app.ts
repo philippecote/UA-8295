@@ -703,6 +703,7 @@ function renderTerminal(machine: UA8295Machine | null, terminal: "a" | "b", labe
         ${state.appMode === "transmission" ? `<span>${terminal === "a" ? "Sender / receiver A" : "Sender / receiver B"}</span>` : ""}
       </div>
       <div class="device">
+        <div class="case-lid" aria-hidden="true"><span></span></div>
         <div class="device-label">PHILIPS USFA UA-8295/00</div>
         <div class="display-section">
           <div class="display-bezel" data-terminal="${terminal}">${renderDisplay(displayText, machine?.hardware.display.brightnessLevel())}</div>
@@ -761,7 +762,7 @@ const KEYBOARD_ROWS: KeySpec[][] = [
     { label: "8", binding: "8", variant: "digit" },
     { label: "9", binding: "9", variant: "digit" },
     { label: "0", binding: "0", variant: "digit" },
-    { label: "DELETE", binding: "DEL", variant: "fn" },
+    { label: "DELETE", lines: ["DELETE", "⌫"], binding: "DEL", variant: "fn" },
     { label: "ACK NAK", lines: ["ACK", "NAK"], binding: "ACK_NAK", variant: "fn", ariaLabel: "Ack/Nak" }
   ],
   // Row 2: QWERTY top row, DISPL
@@ -776,7 +777,7 @@ const KEYBOARD_ROWS: KeySpec[][] = [
     { label: "I", binding: "I", variant: "letter" },
     { label: "O", binding: "O", variant: "letter" },
     { label: "P", binding: "P", variant: "letter" },
-    { label: "DISPL", binding: "DISPL", variant: "fn", span: 2 }
+    { label: "DISPL", binding: "DISPL", variant: "fn" }
   ],
   // Row 3: home row, =, INPUT PRINT
   [
@@ -789,12 +790,12 @@ const KEYBOARD_ROWS: KeySpec[][] = [
     { label: "J", binding: "J", variant: "letter" },
     { label: "K", binding: "K", variant: "letter" },
     { label: "L", binding: "L", variant: "letter" },
-    { label: "=", binding: "=", variant: "punct" },
-    { label: "INPUT PRINT", lines: ["INPUT", "PRINT"], binding: "INPUT_PRINT", variant: "fn", span: 2 }
+    { label: "=", lines: ["≡"], binding: "=", variant: "punct" },
+    { label: "INPUT PRINT", lines: ["INPUT", "PRINT"], binding: "INPUT_PRINT", variant: "fn" }
   ],
   // Row 4: shift, ZXC..., punctuation, ENCR DECR
   [
-    { label: "^", binding: "^", variant: "shift", ariaLabel: "Shift" },
+    { label: "^", lines: ["▭", "↑"], binding: "^", variant: "shift", ariaLabel: "Shift" },
     { label: "Z", binding: "Z", variant: "letter" },
     { label: "X", binding: "X", variant: "letter" },
     { label: "C", binding: "C", variant: "letter" },
@@ -809,10 +810,10 @@ const KEYBOARD_ROWS: KeySpec[][] = [
   ],
   // Row 5: cursor scroll left, spacebar, cursor scroll right, SEND
   [
-    { label: "Cursor Scroll Left", lines: ["←|→"], binding: "SCROLL_LEFT", variant: "scroll", ariaLabel: "Cursor scroll left" },
-    { label: "SPACE", lines: [], binding: "SPACE", variant: "space", span: 8, ariaLabel: "Space" },
-    { label: "Cursor Scroll Right", lines: ["←|→"], binding: "SCROLL_RIGHT", variant: "scroll", ariaLabel: "Cursor scroll right" },
-    { label: "SEND", binding: "SEND", variant: "send", span: 2 }
+    { label: "Cursor Scroll Left", lines: ["↔"], binding: "SCROLL_LEFT", variant: "scroll", ariaLabel: "Cursor scroll left" },
+    { label: "SPACE", lines: [], binding: "SPACE", variant: "space", ariaLabel: "Space" },
+    { label: "Cursor Scroll Right", lines: ["↔"], binding: "SCROLL_RIGHT", variant: "scroll", ariaLabel: "Cursor scroll right" },
+    { label: "SEND", binding: "SEND", variant: "send" }
   ]
 ];
 
