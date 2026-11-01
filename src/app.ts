@@ -6,7 +6,8 @@ import { hex } from "./memory";
 import { formatTrace, type TraceEntry } from "./mcs51";
 import { UA8295LinkedPair } from "./radio-link";
 import { loadBundledRomSet, loadRomSetFromFiles, ROM_SPECS, type RomSet } from "./roms";
-import { UA8295Machine } from "./ua8295";
+import { decodeSerialSettings, MAIN_CPU_MACHINE_CYCLES_PER_SECOND } from "./serial-port";
+import { HARDWARE_FAULTS, UA8295Machine, type HardwareFault } from "./ua8295";
 import { formatTraceEvent, summarizeTraceEvents, type CpuName, type TraceEventKind } from "./trace";
 import { decodeTerminalMemory, encodeTerminalMemory, SRAM_STORAGE_PREFIX } from "./sram-persistence";
 
@@ -21,6 +22,8 @@ const state: {
   ioKindFilter: TraceEventKind | "all";
   traceAllXdata: boolean;
   continuousRun: boolean;
+  /** Run the emulator as fast as the host allows instead of at device speed. */
+  turbo: boolean;
   uiMode: "device" | "developer";
   appMode: "single" | "transmission";
   activeTerminal: "a" | "b";
@@ -36,6 +39,7 @@ const state: {
   ioKindFilter: "all",
   traceAllXdata: false,
   continuousRun: false,
+  turbo: false,
   uiMode: "device",
   appMode: "single",
   activeTerminal: "a",
@@ -115,6 +119,7 @@ function installDebugSurface(): void {
       pressedKeys: state.machine?.hardware.keyboard.pressedKeys() ?? [],
       heldKeys: Array.from(heldKeys.entries()).map(([id, value]) => ({ id, ...value })),
       mainPC: state.machine?.mainCpu.snapshot().pc.toString(16),
+      mainCycles: state.machine?.mainCpu.cycles ?? 0,
       iram1c: state.machine?.mainCpu.iram[0x1c].toString(16),
       iram20: state.machine?.mainCpu.iram[0x20].toString(16),
       continuousRun: state.continuousRun,
@@ -149,6 +154,7 @@ function render(): void {
       <div class="top-actions">
         <button data-action="load-bundled">Load bundled ROMs</button>
         <button data-action="continuous" ${state.machine ? "" : "disabled"}>${state.continuousRun ? "Pause" : "Run"}</button>
+        <button data-action="toggle-turbo" aria-pressed="${state.turbo}" title="Real time paces the 80C31s at device speed; Turbo runs them flat out and uses much more power">${state.turbo ? "Turbo" : "Real time"}</button>
         <button data-action="toggle-app-mode" ${state.machine ? "" : "disabled"}>${state.appMode === "single" ? "Transmission Test" : "Single Unit"}</button>
         <button data-action="toggle-ui-mode">${state.uiMode === "developer" ? "Device Mode" : "Developer Mode"}</button>
       </div>
@@ -191,6 +197,15 @@ function render(): void {
         <input data-action="trace-all-xdata" type="checkbox" ${state.traceAllXdata ? "checked" : ""} />
         Trace SRAM/text ROM MOVX
       </label>
+    </section>
+
+    <section class="panel">
+      <div class="panel-heading">
+        <h2>Fault Injection (terminal ${state.activeTerminal.toUpperCase()})</h2>
+        <button data-action="power-cycle" ${state.machine ? "" : "disabled"}>Power cycle</button>
+      </div>
+      <p>Faults are detected by the original ROMs during the power-up check-out (manual Section 3, paragraph 3.2).</p>
+      <div class="fault-list">${renderFaultControls()}</div>
     </section>
 
     <section class="grid">
@@ -279,6 +294,11 @@ function render(): void {
   app.querySelector('[data-action="run-both-1000"]')?.addEventListener("click", () => runBoth(1000));
   app.querySelector('[data-action="run-frame"]')?.addEventListener("click", () => runFrame());
   app.querySelector('[data-action="continuous"]')?.addEventListener("click", toggleContinuousRun);
+  app.querySelector('[data-action="toggle-turbo"]')?.addEventListener("click", () => {
+    state.turbo = !state.turbo;
+    state.status = state.turbo ? "Turbo: emulating as fast as the host allows." : "Real time: emulating at device speed.";
+    render();
+  });
   app.querySelector('[data-action="toggle-app-mode"]')?.addEventListener("click", toggleAppMode);
   app.querySelector('[data-action="toggle-ui-mode"]')?.addEventListener("click", toggleUiMode);
   app.querySelector<HTMLInputElement>('[data-action="trace-all-xdata"]')?.addEventListener("change", (event: Event) => {
@@ -323,6 +343,63 @@ function render(): void {
       if ((event.key === " " || event.key === "Enter") && !event.repeat) setKey(key, true, terminal);
     });
     button.addEventListener("keyup", () => setKey(key, false, terminal));
+  });
+  app.querySelectorAll<HTMLSelectElement>('select[data-peripheral="battery"]').forEach((select) => {
+    select.addEventListener("change", () => {
+      const machine = machineFor(select.dataset.terminal === "b" ? "b" : "a");
+      if (machine) machine.hardware.charger.battery = select.value as "charged" | "low" | "flat";
+      renderDeviceTick();
+    });
+  });
+  app.querySelectorAll<HTMLInputElement>("input[data-peripheral]").forEach((input) => {
+    input.addEventListener("change", () => {
+      const machine = machineFor(input.dataset.terminal === "b" ? "b" : "a");
+      if (!machine) return;
+      if (input.dataset.peripheral === "supply") machine.hardware.charger.externalSupply = input.checked;
+      if (input.dataset.peripheral === "busy") machine.hardware.printer.busy = input.checked;
+    });
+  });
+  app.querySelectorAll<HTMLFormElement>("form.printer-input").forEach((form) => {
+    const printerFor = () => machineFor(form.dataset.terminal === "b" ? "b" : "a")?.hardware.printer;
+    form.addEventListener("submit", (event) => {
+      event.preventDefault();
+      const input = form.elements.namedItem("text");
+      const printer = printerFor();
+      if (!(input instanceof HTMLInputElement) || !printer) return;
+      // The terminal keyboard has only upper case; leave room between keystrokes.
+      printer.characterGapBits = 30;
+      printer.send(input.value.toUpperCase());
+      input.value = "";
+    });
+    form.querySelectorAll<HTMLButtonElement>("button[data-control]").forEach((button) => {
+      button.addEventListener("click", () => {
+        const printer = printerFor();
+        if (!printer) return;
+        printer.characterGapBits = 30;
+        printer.send([Number(button.dataset.control)]);
+      });
+    });
+    form.querySelector<HTMLButtonElement>('[data-peripheral="clear-paper"]')?.addEventListener("click", () => {
+      printerFor()?.clearReceived();
+      renderDeviceTick();
+    });
+  });
+  app.querySelectorAll<HTMLInputElement>("input[data-fault]").forEach((input) => {
+    input.addEventListener("change", () => {
+      const machine = machineFor(state.activeTerminal);
+      if (!machine) return;
+      machine.setFault(input.dataset.fault as HardwareFault, input.checked);
+      setStatus(`${HARDWARE_FAULTS[input.dataset.fault as HardwareFault].label} ${input.checked ? "injected" : "repaired"}; switch off and on to run the check-out.`);
+      render();
+    });
+  });
+  app.querySelector('[data-action="power-cycle"]')?.addEventListener("click", () => {
+    const machine = machineFor(state.activeTerminal);
+    if (!machine) return;
+    machine.setPowered(false);
+    machine.setPowered(true);
+    setStatus(`Terminal ${state.activeTerminal.toUpperCase()} power-cycled.`);
+    render();
   });
   attachGlobalKeyboard();
 }
@@ -419,33 +496,50 @@ function runFrame(renderAfter = true): void {
   if (renderAfter) render();
 }
 
+// The main 80C31 runs from a 10 MHz crystal: 833,333 machine cycles per
+// second (see serial-port.ts). Emulating faster than that only burns host
+// power, so continuous runs are paced to it unless Turbo is selected.
+const DEVICE_CYCLES_PER_MS = MAIN_CPU_MACHINE_CYCLES_PER_SECOND / 1000;
+// Never try to catch up more than this much device time after a stall
+// (a hidden tab, a debugger pause, a slow frame).
+const MAX_CYCLE_CREDIT = DEVICE_CYCLES_PER_MS * 100;
+let cycleCredit = 0;
+let lastPacedFrame: number | null = null;
+
 /**
- * Run as many scheduler slices as fit in `budgetMs` of real time. Targets
- * near-real-device CPU speed without ever blowing past one animation frame.
+ * Run scheduler chunks until this frame's share of real device time has been
+ * emulated, never spending more than `budgetMs` of host time. In Turbo mode
+ * the whole budget is used, as fast as the host allows.
  *
- * The 80C31 ran at ~922k instructions/sec; at 60 FPS that's ~15k instructions
- * per frame. With a 12 ms budget out of a 16.7 ms frame we get plenty of
- * headroom for the browser to paint and respond to input. The previous fixed
- * `runScheduler(40, 80)` only emulated ~3,200 instructions/frame (~20% of
- * real speed), which left key-press handshakes too short to advance prompts.
+ * Chunks are 64 slices (about 5,120 instructions per CPU) to amortize the
+ * per-call overhead of `runScheduler`.
  */
 function runFrameTimeBudgeted(budgetMs: number = 12): void {
   const machine = state.machine;
   if (!machine) return;
   const start = performance.now();
-  // Larger chunks amortize the per-call overhead of `runScheduler` (which
-  // currently allocates a result array and pushes per-instruction trace entries
-  // even when tracing is off). 64 slices ≈ 5,120 instructions/CPU per call.
+  const elapsed = lastPacedFrame === null ? 1000 / 60 : Math.min(start - lastPacedFrame, 100);
+  lastPacedFrame = start;
+  cycleCredit = Math.min(cycleCredit + elapsed * DEVICE_CYCLES_PER_MS, MAX_CYCLE_CREDIT);
   const SLICES_PER_CHUNK = 64;
+  const peer = state.appMode === "transmission" ? state.peerMachine : null;
+  syncPeripheralSettings(machine);
+  if (peer) syncPeripheralSettings(peer);
   try {
-    while (performance.now() - start < budgetMs) {
+    while (performance.now() - start < budgetMs && (state.turbo || cycleCredit > 0)) {
+      const before = Math.max(machine.mainCpu.cycles, peer?.mainCpu.cycles ?? 0);
       if (state.appMode === "transmission" && state.linkedPair) {
         state.linkedPair.runScheduler(SLICES_PER_CHUNK, 80, false);
       } else {
         machine.runScheduler(SLICES_PER_CHUNK, 80, false);
       }
       advanceKeyHolds(SLICES_PER_CHUNK);
+      const ran = Math.max(machine.mainCpu.cycles, peer?.mainCpu.cycles ?? 0) - before;
+      // Both terminals switched off: nothing to emulate this frame.
+      if (ran <= 0) break;
+      cycleCredit -= ran;
     }
+    if (state.turbo) cycleCredit = 0;
   } catch (error) {
     stopContinuousRun();
     state.status = `CPU stopped: ${error instanceof Error ? error.message : String(error)}`;
@@ -469,6 +563,21 @@ function renderDeviceTick(): void {
     const terminal = bezel.dataset.terminal === "b" ? "b" : "a";
     const machine = machineFor(terminal);
     if (machine) bezel.innerHTML = renderDisplay(machine.hardware.display.displayLine(), machine.hardware.display.brightnessLevel());
+  }
+  for (const row of app.querySelectorAll<HTMLElement>(".indicator-row[data-terminal]")) {
+    const html = renderIndicators(machineFor(row.dataset.terminal === "b" ? "b" : "a"));
+    if (row.innerHTML !== html) row.innerHTML = html;
+  }
+  for (const badge of app.querySelectorAll<HTMLElement>(".alarm-badge[data-terminal]")) {
+    badge.hidden = !alarmSounding(machineFor(badge.dataset.terminal === "b" ? "b" : "a"));
+  }
+  for (const paper of app.querySelectorAll<HTMLElement>(".printer-paper[data-terminal]")) {
+    const printer = machineFor(paper.dataset.terminal === "b" ? "b" : "a")?.hardware.printer;
+    const text = printer?.transcript() || "Printer paper is empty.";
+    if (paper.textContent !== text) {
+      paper.textContent = text;
+      paper.scrollTop = paper.scrollHeight;
+    }
   }
   const linkStatus = app.querySelector<HTMLElement>(".link-status");
   if (linkStatus) linkStatus.textContent = state.appMode === "transmission" ? `Radio link: ${state.linkedPair?.link.status() ?? "disconnected"}` : "Single terminal";
@@ -514,6 +623,19 @@ function applyTraceRecordingForMode(): void {
   state.peerMachine?.traceLog.setRecording(state.uiMode === "developer");
 }
 
+/**
+ * The attached printer and computer are set up to match the terminal's PRTR-I
+ * and COMP-I configuration pages (SRAM 0x730E / 0x730F), as an operator would
+ * set the equipment's own switches.
+ */
+function syncPeripheralSettings(machine: UA8295Machine): void {
+  const printer = decodeSerialSettings(machine.mainBus.xram[0x130e]);
+  const computer = decodeSerialSettings(machine.mainBus.xram[0x130f], "computer");
+  const hardware = machine.hardware;
+  if (JSON.stringify(hardware.printer.settings) !== JSON.stringify(printer)) hardware.printer.settings = printer;
+  if (JSON.stringify(hardware.computer.settings) !== JSON.stringify(computer)) hardware.computer.settings = computer;
+}
+
 function scheduleContinuousRun(): void {
   if (!state.continuousRun) return;
   animationHandle = requestAnimationFrame(() => {
@@ -537,6 +659,8 @@ function scheduleContinuousRun(): void {
 
 function stopContinuousRun(): void {
   state.continuousRun = false;
+  lastPacedFrame = null;
+  cycleCredit = 0;
   if (animationHandle !== null) {
     cancelAnimationFrame(animationHandle);
     animationHandle = null;
@@ -577,6 +701,20 @@ const heldKeys = new Map<string, HeldKeyState & { key: FrontPanelKey; terminal: 
 function setKey(key: FrontPanelKey, isPressed: boolean, terminal: "a" | "b" = state.activeTerminal): void {
   const machine = machineFor(terminal);
   if (!machine) return;
+  if (key === "ON_OFF") {
+    // ON/OFF is a power switch, not a keyboard-matrix key.
+    if (isPressed) {
+      const wasPowered = machine.isPowered();
+      machine.setPowered(!wasPowered);
+      setStatus(
+        !wasPowered && !machine.isPowered()
+          ? `Terminal ${terminal.toUpperCase()} does not respond: the battery is flat (manual 3.1).`
+          : `Terminal ${terminal.toUpperCase()} switched ${machine.isPowered() ? "on" : "off"}.`
+      );
+      renderDeviceTick();
+    }
+    return;
+  }
   const heldId = `${terminal}:${key}`;
   if (isPressed) {
     heldKeys.set(heldId, { key, terminal, slicesHeld: 0, releaseRequested: false });
@@ -702,6 +840,7 @@ function renderTerminal(machine: UA8295Machine | null, terminal: "a" | "b", labe
     <section class="terminal-shell${active}" data-terminal="${terminal}">
       <div class="terminal-heading">
         <strong>${escapeHtml(label)}</strong>
+        <span class="alarm-badge" data-terminal="${terminal}" ${alarmSounding(machine) ? "" : "hidden"}>♪ ALARM</span>
         ${state.appMode === "transmission" ? `<span>${terminal === "a" ? "Sender / receiver A" : "Sender / receiver B"}</span>` : ""}
       </div>
       <div class="device">
@@ -710,19 +849,67 @@ function renderTerminal(machine: UA8295Machine | null, terminal: "a" | "b", labe
         <div class="display-section">
           <div class="display-bezel" data-terminal="${terminal}">${renderDisplay(displayText, machine?.hardware.display.brightnessLevel())}</div>
           <div class="indicator-panel">
-            <div class="indicator-row">
-              <span>BATTERY LOW</span>
-              <span>CHARGE</span>
-              <span class="${machine?.receiveMessageIndicatorLit() ? "is-on" : ""}">MESSAGE</span>
-              <span class="${machine?.hardware.modemRadio.isTransmitting() ? "is-on" : ""}">TRANSMIT</span>
-            </div>
+            <div class="indicator-row" data-terminal="${terminal}">${renderIndicators(machine)}</div>
             <div class="brand">PHILIPS<br>USFA B.V</div>
           </div>
         </div>
         <div class="keyboard">${renderKeys(terminal)}</div>
         ${state.uiMode === "developer" ? `<div class="keyboard-status">${machine?.hardware.keyboard.describe() ?? "Keyboard inactive"}</div><div class="display-details">${renderDisplayDetails(machine)}</div>` : ""}
       </div>
+      ${renderPeripherals(machine, terminal)}
     </section>
+  `;
+}
+
+function renderFaultControls(): string {
+  const machine = machineFor(state.activeTerminal);
+  return (Object.entries(HARDWARE_FAULTS) as Array<[HardwareFault, (typeof HARDWARE_FAULTS)[HardwareFault]]>)
+    .map(([fault, { label, errorCode }]) => `<label class="checkbox"><input type="checkbox" data-fault="${fault}" ${machine?.hasFault(fault) ? "checked" : ""} ${machine ? "" : "disabled"} /> ${escapeHtml(label)} <code>${errorCode}</code></label>`)
+    .join("");
+}
+
+function renderIndicators(machine: UA8295Machine | null): string {
+  const powered = machine?.isPowered() ?? false;
+  const lamp = (label: string, lit: boolean) => `<span class="${powered && lit ? "is-on" : ""}">${label}</span>`;
+  return [
+    lamp("BATTERY LOW", machine?.hardware.charger.battery === "low"),
+    lamp("CHARGE", machine?.hardware.charger.isCharging() ?? false),
+    lamp("MESSAGE", machine?.receiveMessageIndicatorLit() ?? false),
+    lamp("TRANSMIT", machine?.hardware.modemRadio.isTransmitting() ?? false)
+  ].join("");
+}
+
+function alarmSounding(machine: UA8295Machine | null): boolean {
+  return machine ? machine.hardware.buzzer.isSounding(machine.mainCpu.cycles) : false;
+}
+
+/**
+ * Equipment attached to the terminal's connectors: the external DC supply and
+ * a serial printer terminal on the printer port.
+ */
+function renderPeripherals(machine: UA8295Machine | null, terminal: "a" | "b"): string {
+  if (!machine) return "";
+  const printer = machine.hardware.printer;
+  const settings = printer.settings;
+  const lineSettings = settings.format === "telex" ? "50 Bd ITA2 telex" : `${settings.baud} Bd, parity ${settings.parity}`;
+  return `
+    <div class="peripherals" data-terminal="${terminal}">
+      <div class="peripheral-row">
+        <label class="checkbox"><input type="checkbox" data-peripheral="supply" data-terminal="${terminal}" ${machine.hardware.charger.externalSupply ? "checked" : ""} /> External 10-30 V DC supply</label>
+        <label class="checkbox">Battery <select data-peripheral="battery" data-terminal="${terminal}">${(["charged", "low", "flat"] as const).map((level) => `<option value="${level}" ${machine.hardware.charger.battery === level ? "selected" : ""}>${level}</option>`).join("")}</select></label>
+        <label class="checkbox"><input type="checkbox" data-peripheral="busy" data-terminal="${terminal}" ${printer.busy ? "checked" : ""} /> Printer BUSY</label>
+        <span class="peripheral-note">Printer: <span class="printer-settings" data-terminal="${terminal}">${lineSettings}</span> (follows PRTR-I)</span>
+      </div>
+      <pre class="printer-paper" data-terminal="${terminal}" aria-label="Printer output">${escapeHtml(printer.transcript()) || "Printer paper is empty."}</pre>
+      <form class="printer-input" data-terminal="${terminal}">
+        <input type="text" name="text" placeholder="Type on the printer terminal (after SHIFT+INPUT)" autocomplete="off" />
+        <button type="submit">Send</button>
+        <button type="button" data-control="15" title="CTRL-O: start echo">^O</button>
+        <button type="button" data-control="14" title="CTRL-N: stop echo">^N</button>
+        <button type="button" data-control="3" title="CTRL-C: end input">^C</button>
+        <button type="button" data-peripheral="clear-paper">Tear off</button>
+      </form>
+    </div>
   `;
 }
 

@@ -15,17 +15,29 @@ export class ExternalBus {
   readonly xram: Uint8Array;
   readonly textRom: Uint8Array;
   readonly ioEvents: string[] = [];
+  /**
+   * Mask applied to SRAM offsets. All ones on healthy hardware; clearing a bit
+   * models an open address line, so two SRAM cells alias each other.
+   */
+  xramAddressMask = 0xffff;
   private readonly xramBase: number;
+
+  /**
+   * True when the board gates PSEN and RD together over the SRAM, so MOVC and
+   * instruction fetches in the SRAM window read the same cells as MOVX.
+   */
+  private readonly xramInCodeSpace: boolean;
 
   constructor(
     code: Uint8Array,
-    options: { xramBase?: number; xramSize?: number; defaultRead?: number; textRom?: Uint8Array } = {}
+    options: { xramBase?: number; xramSize?: number; defaultRead?: number; textRom?: Uint8Array; xramInCodeSpace?: boolean } = {}
   ) {
     const xramSize = options.xramSize ?? 0x10000;
     if (xramSize <= 0 || xramSize > 0x10000) {
       throw new Error("xramSize must be between 1 and 65536");
     }
     this.xramBase = options.xramBase ?? 0;
+    this.xramInCodeSpace = options.xramInCodeSpace ?? false;
     this.codeMem = fit64k(code);
     this.xram = new Uint8Array(xramSize);
     // Mimic real CMOS SRAM / EPROM power-up state: bytes default to 0xFF rather
@@ -43,14 +55,19 @@ export class ExternalBus {
   private readonly defaultRead: number;
 
   readCode(addr: number): number {
-    return this.codeMem[addr & 0xffff];
+    const masked = addr & 0xffff;
+    if (this.xramInCodeSpace) {
+      const xramOffset = masked - this.xramBase;
+      if (xramOffset >= 0 && xramOffset < this.xram.length) return this.xram[xramOffset & this.xramAddressMask];
+    }
+    return this.codeMem[masked];
   }
 
   readXdata(addr: number): number {
     const masked = addr & 0xffff;
     const xramOffset = masked - this.xramBase;
     if (xramOffset >= 0 && xramOffset < this.xram.length) {
-      return this.xram[xramOffset];
+      return this.xram[xramOffset & this.xramAddressMask];
     }
     const textAddr = masked - 0x8000;
     if (textAddr >= 0 && textAddr < this.textRom.length) {
@@ -78,7 +95,7 @@ export class ExternalBus {
     const byte = value & 0xff;
     const xramOffset = masked - this.xramBase;
     if (xramOffset >= 0 && xramOffset < this.xram.length) {
-      this.xram[xramOffset] = byte;
+      this.xram[xramOffset & this.xramAddressMask] = byte;
       return;
     }
     this.ioEvents.push(`write_xdata 0x${hex(masked, 4)} <- 0x${hex(byte, 2)}`);

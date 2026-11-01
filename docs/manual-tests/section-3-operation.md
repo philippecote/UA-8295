@@ -157,11 +157,15 @@ promoted to `status: "pass"` and retained as regression coverage.
 {
   "id": "M3-2.2-CHARGING-MODES",
   "manualSection": "3.2.2",
-  "title": "SHIFT+C selects normal, quick, or fast charging",
-  "status": "boundary",
-  "reason": "External supply, battery state, charge timer, and charge LED are not modeled",
-  "steps": [{ "pressShifted": "C" }],
-  "expectDisplay": "CHARG"
+  "title": "SHIFT+C offers normal, quick, and fast charging in turn",
+  "status": "pass",
+  "steps": [
+    { "pressShifted": "C", "expectDisplay": " CHARGING (Y/N)" },
+    { "press": "N", "expectDisplay": "QUICK CHARGING (Y/N)" },
+    { "press": "N", "expectDisplay": "FAST CHARGING (Y/N)" },
+    { "press": "N", "expectDisplay": "NO CHARGING" }
+  ],
+  "expectDisplay": "NO CHARGING"
 }
 ```
 
@@ -324,17 +328,8 @@ promoted to `status: "pass"` and retained as regression coverage.
 }
 ```
 
-```ua8295-test
-{
-  "id": "M3-2.13-ACK-NAK-LINK",
-  "manualSection": "3.2.13",
-  "title": "Manual ACK and NAK reach the original transmitting terminal",
-  "status": "todo",
-  "reason": "Manual ACK and NAK packets reach the peer UART, but a late response on the original sender's operator display remains unverified",
-  "steps": [{ "press": "ACK_NAK" }],
-  "expectDisplay": "ACKNOWLEDGED"
-}
-```
+The late manual ACK reaching the original sender (2.13) needs two linked
+terminals and is covered by `web-tests/manual-linked-responses.test.ts`.
 
 ```ua8295-test
 {
@@ -358,33 +353,13 @@ promoted to `status: "pass"` and retained as regression coverage.
     { "press": "A" },
     { "press": "=", "settleSlices": 1200 }
   ],
-  "expectDisplay": "KEY: AIEH"
+  "expectDisplay": "KEY: JPKI"
 }
 ```
 
-```ua8295-test
-{
-  "id": "M3-2.15-PRINTER",
-  "manualSection": "3.2.15",
-  "title": "Printer input, output, echo controls, and automatic printing work",
-  "status": "boundary",
-  "reason": "The external printer serial port is not modeled",
-  "steps": [],
-  "expectDisplay": "PRINT"
-}
-```
-
-```ua8295-test
-{
-  "id": "M3-2.16-COMPUTER",
-  "manualSection": "3.2.16",
-  "title": "An external computer can operate the terminal as a crypto modem",
-  "status": "boundary",
-  "reason": "The computer-port protocol and connector are not modeled",
-  "steps": [],
-  "expectDisplay": "FUNCTION"
-}
-```
+The printer (2.15) and external computer (2.16) procedures need an attached
+serial device, so they are covered by `web-tests/manual-printer.test.ts` and
+`web-tests/manual-computer.test.ts` rather than display-only scenarios.
 
 ## 2.8 Message transmission
 

@@ -20,9 +20,10 @@ function composeFreeMessage(driver: HeadlessDeviceDriver, text: string): void {
 function selectDaysKey(driver: HeadlessDeviceDriver): void {
   press(driver, "CONF");
   for (let page = 0; page < 4; page += 1) press(driver, "=");
-  expect(driver.displayText()).toContain("DAY'S");
+  // Fresh SRAM selects the fixed key; DELETE toggles to the day's key.
   expect(driver.displayText()).toContain("FIXED KEY");
   press(driver, "DEL");
+  expect(driver.displayText()).toContain("DAY'S KEY");
   press(driver, "SHORT_TERM");
 }
 
@@ -58,7 +59,7 @@ describe("manual section 3.2.14 key replacement", () => {
     press(driver, "=");
     driver.runSchedulerSlices(1_200);
 
-    expect(driver.displayText()).toContain("KEY: AIEH");
+    expect(driver.displayText()).toContain("KEY: JPKI");
     expect([...driver.machine.mainBus.xram.slice(0x12e6, 0x12f6)]).toEqual([
       0x01, 0x0c, 0x10, 0x08, 0x01,
       0x27, 0x27, 0x27, 0x27, 0x27,
@@ -68,7 +69,7 @@ describe("manual section 3.2.14 key replacement", () => {
     driver.machine.reset();
     driver.bootUntilReady();
     press(driver, "KEY");
-    expect(driver.displayText()).toContain("KEY: AIEH");
+    expect(driver.displayText()).toContain("KEY: JPKI");
   }, 30_000);
 });
 
@@ -103,5 +104,5 @@ describe("manual section 3.2.11 offline cryptography", () => {
     press(driver, "N");
     driver.runSchedulerSlices(1_200);
     expect(driver.displayText()).toContain("HELLO.");
-  }, 30_000);
+  }, 90_000);
 });

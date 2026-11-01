@@ -134,7 +134,7 @@ export function fmtBit(bitAddr: number): string {
   return `0x${hex(bit, 2)}`;
 }
 
-export function instructionLength(opcode: number): number {
+function computeInstructionLength(opcode: number): number {
   if (
     new Set([
       0x02, 0x10, 0x12, 0x20, 0x30, 0x43, 0x53, 0x63, 0x75, 0x85, 0x90, 0xb4, 0xb5, 0xb6,
@@ -165,7 +165,7 @@ export function instructionLength(opcode: number): number {
   return 1;
 }
 
-export function instructionCycles(opcode: number): number {
+function computeInstructionCycles(opcode: number): number {
   if (opcode === 0x84 || opcode === 0xa4) return 4;
   if (
     opcode === 0x02 ||
@@ -192,10 +192,22 @@ export function instructionCycles(opcode: number): number {
   ) {
     return 2;
   }
-  if (instructionLength(opcode) >= 2 && (opcode <= 0x7f || opcode >= 0x85)) {
+  if (computeInstructionLength(opcode) >= 2 && (opcode <= 0x7f || opcode >= 0x85)) {
     return 2;
   }
   return 1;
+}
+
+// Decoded once: these lookups run for every emulated instruction.
+const INSTRUCTION_LENGTHS = Uint8Array.from({ length: 256 }, (_, opcode) => computeInstructionLength(opcode));
+const INSTRUCTION_CYCLES = Uint8Array.from({ length: 256 }, (_, opcode) => computeInstructionCycles(opcode));
+
+export function instructionLength(opcode: number): number {
+  return INSTRUCTION_LENGTHS[opcode & 0xff];
+}
+
+export function instructionCycles(opcode: number): number {
+  return INSTRUCTION_CYCLES[opcode & 0xff];
 }
 
 export class MCS51 {
@@ -203,6 +215,11 @@ export class MCS51 {
   readonly iram = new Uint8Array(128);
   readonly sfr = new Map<number, number>();
   halted = false;
+  /**
+   * Hardware fault hook: a processor whose clock or reset line has failed.
+   * Time still passes so coupled schedulers stay aligned, but nothing executes.
+   */
+  stalled = false;
   cycles = 0;
   private activeInstructionPc: number | null = null;
   private activeOpcode = 0;
@@ -304,6 +321,19 @@ export class MCS51 {
     return value;
   }
 
+  /**
+   * Read-modify-write instructions (ANL/ORL/XRL/INC/DEC/DJNZ direct and the
+   * bit writes) read a port's output latch rather than its pins, so a line
+   * pulled low externally is not copied back into the latch.
+   */
+  private readForModify(addr: number): number {
+    const masked = addr & 0xff;
+    if (!PORT_SFRS.has(masked)) return this.readDirect(masked);
+    const latchValue = this.sfr.get(masked) ?? 0;
+    this.recordSfrAccess("read", masked, latchValue);
+    return latchValue;
+  }
+
   writeDirect(addr: number, value: number): void {
     const masked = addr & 0xff;
     const byte = u8(value);
@@ -353,9 +383,14 @@ export class MCS51 {
     }
   }
 
-  step(): TraceEntry {
+  /** Execute one instruction. `trace: false` skips building the raw-byte listing. */
+  step(trace = true): TraceEntry {
     if (this.halted) {
       throw new CpuError(`${this.name} is halted`);
+    }
+    if (this.stalled) {
+      this.cycles += 1;
+      return { pc: this.pc, opcode: 0, bytes: [], text: "STALLED", a: this.a, b: this.b, psw: this.psw, sp: this.sp, dptr: this.dptr };
     }
     const startPc = this.pc;
     const opcode = this.fetchByte();
@@ -448,16 +483,16 @@ export class MCS51 {
     } else if (opcode === 0x42 || opcode === 0x52 || opcode === 0x62) {
       const addr = direct();
       const op = opcode === 0x42 ? "|" : opcode === 0x52 ? "&" : "^";
-      this.writeDirect(addr, applyLogic(op, this.readDirect(addr), this.a));
+      this.writeDirect(addr, applyLogic(op, this.readForModify(addr), this.a));
       text = `${logicName(op)} ${fmtDirect(addr)}, A`;
     } else if (opcode === 0x43 || opcode === 0x53 || opcode === 0x63) {
       const addr = direct();
       const value = imm();
       const op = opcode === 0x43 ? "|" : opcode === 0x53 ? "&" : "^";
-      this.writeDirect(addr, applyLogic(op, this.readDirect(addr), value));
+      this.writeDirect(addr, applyLogic(op, this.readForModify(addr), value));
       text = `${logicName(op)} ${fmtDirect(addr)}, #0x${hex(value, 2)}`;
     } else if ((opcode >= 0x44 && opcode <= 0x4f) || (opcode >= 0x54 && opcode <= 0x5f) || (opcode >= 0x64 && opcode <= 0x6f)) {
-      const [value, operand] = this.aluOperand((opcode & 0x0f) | 0x24, direct, imm);
+      const [value, operand] = this.aluOperand(opcode, direct, imm);
       const op = opcode < 0x50 ? "|" : opcode < 0x60 ? "&" : "^";
       this.a = applyLogic(op, this.a, value);
       text = `${logicName(op)} A, ${operand}`;
@@ -569,7 +604,7 @@ export class MCS51 {
     this.advanceTimers(elapsedCycles, startPc);
     this.dispatchInterruptIfPending(startPc);
     this.updateParity();
-    const bytes = Array.from({ length: instructionLength(opcode) }, (_, i) => this.bus.readCode(startPc + i));
+    const bytes = trace ? Array.from({ length: instructionLength(opcode) }, (_, i) => this.bus.readCode(startPc + i)) : [];
     this.activeInstructionPc = null;
     return { pc: startPc, opcode, bytes, text, a: this.a, b: this.b, psw: this.psw, sp: this.sp, dptr: this.dptr };
   }
@@ -577,7 +612,7 @@ export class MCS51 {
   run(steps: number, trace = false): TraceEntry[] {
     const entries: TraceEntry[] = [];
     for (let i = 0; i < steps; i += 1) {
-      const entry = this.step();
+      const entry = this.step(trace);
       if (trace) entries.push(entry);
       if (this.halted) break;
     }
@@ -874,7 +909,7 @@ export class MCS51 {
     const bit = bitAddr & 0xff;
     const byteAddr = bit < 0x80 ? 0x20 + (bit >> 3) : bit & 0xf8;
     const mask = 1 << (bit & 7);
-    const current = this.readDirect(byteAddr);
+    const current = this.readForModify(byteAddr);
     this.writeDirect(byteAddr, value ? current | mask : current & ~mask);
   }
 
@@ -955,7 +990,7 @@ export class MCS51 {
     }
     if (opcode === 0x05) {
       const addr = direct();
-      this.writeDirect(addr, this.readDirect(addr) + 1);
+      this.writeDirect(addr, this.readForModify(addr) + 1);
       return `INC ${fmtDirect(addr)}`;
     }
     if (opcode === 0x06 || opcode === 0x07) {
@@ -975,7 +1010,7 @@ export class MCS51 {
     }
     if (opcode === 0x15) {
       const addr = direct();
-      this.writeDirect(addr, this.readDirect(addr) - 1);
+      this.writeDirect(addr, this.readForModify(addr) - 1);
       return `DEC ${fmtDirect(addr)}`;
     }
     if (opcode === 0x16 || opcode === 0x17) {
@@ -1174,7 +1209,7 @@ export class MCS51 {
     if (opcode === 0xd5) {
       const addr = direct();
       const off = imm();
-      const value = u8(this.readDirect(addr) - 1);
+      const value = u8(this.readForModify(addr) - 1);
       this.writeDirect(addr, value);
       if (value !== 0) this.jumpRel(off);
       return `DJNZ ${fmtDirect(addr)}, ${signed(off)}`;

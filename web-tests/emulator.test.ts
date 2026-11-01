@@ -29,6 +29,31 @@ describe("browser MCS-51 core", () => {
     expect(cpu.pc).toBe(3);
   });
 
+  it("applies ORL, ANL and XRL to the addressed register for every Rn form", () => {
+    for (const [base, apply] of [
+      [0x48, (a: number, r: number) => a | r],
+      [0x58, (a: number, r: number) => a & r],
+      [0x68, (a: number, r: number) => a ^ r]
+    ] as const) {
+      for (let reg = 0; reg < 8; reg += 1) {
+        const cpu = new MCS51(new ExternalBus(new Uint8Array([base + reg])));
+        for (let other = 0; other < 8; other += 1) cpu.iram[other] = 0x01 << other;
+        cpu.a = 0x5a;
+        cpu.step();
+        expect(cpu.a, `opcode 0x${(base + reg).toString(16)}`).toBe(apply(0x5a, 0x01 << reg));
+      }
+    }
+  });
+
+  it("reads the port latch, not the pins, for read-modify-write instructions", () => {
+    // SETB P1.1; ANL P1,#0xFF; CPL P1.2 while an external device holds P1.0 low.
+    const hooks = { readSfr: (_cpu: string, address: number, latch: number) => (address === 0x90 ? latch & ~0x01 : latch) };
+    const cpu = new MCS51(new ExternalBus(new Uint8Array([0xd2, 0x91, 0x53, 0x90, 0xff, 0xb2, 0x92])), "cpu", null, {}, hooks);
+    cpu.run(3);
+    expect(cpu.sfr.get(0x90)).toBe(0xfb);
+    expect(cpu.readDirect(0x90)).toBe(0xfa);
+  });
+
   it("loads validated ROMs and runs both CPUs", async () => {
     const machine = new UA8295Machine(await loadTestRomSet());
     expect(machine.mainBus.readXdata(TEXT_ROM_BASE)).toBe(machine.roms.text.data[0]);

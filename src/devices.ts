@@ -1,5 +1,6 @@
 import { hex, type XdataRegion } from "./memory";
 import type { CpuHardwareHooks, MCS51 } from "./mcs51";
+import { SerialPeripheral } from "./serial-port";
 import type { CpuName } from "./trace";
 
 // Full UA-8295 / DA-8520 front-panel set as labelled on the photo-grade chassis.
@@ -146,13 +147,15 @@ export class ClockDevice {
   static readonly CPU_CYCLES_PER_SECOND = 921_600;
   static readonly CPU_CYCLES_PER_TICK = (ClockDevice.CPU_CYCLES_PER_SECOND * 86_400) / ClockDevice.TICKS_PER_DAY;
 
+  /** Hardware fault hook: the timer oscillator has stopped. */
+  stopped = false;
   private displayTimingReadCount = 0;
   private counter = ClockDevice.COUNTER_MODULUS - 1;
   private cycleRemainder = 0;
   private readonly timeDigits = new Uint8Array(4);
 
   readDisplayTiming(baseValue: number, touched: boolean): number {
-    if (!touched) return baseValue & 0xff;
+    if (!touched || this.stopped) return baseValue & 0xff;
     const value = ((baseValue & 0xff) + 0x66 * this.displayTimingReadCount) & 0xff;
     this.displayTimingReadCount += 1;
     return value;
@@ -167,7 +170,7 @@ export class ClockDevice {
   }
 
   advanceCpuCycles(cycles: number): void {
-    if (cycles <= 0) return;
+    if (cycles <= 0 || this.stopped) return;
     this.cycleRemainder += cycles;
     const ticks = Math.floor(this.cycleRemainder / ClockDevice.CPU_CYCLES_PER_TICK);
     if (ticks === 0) return;
@@ -192,10 +195,12 @@ export class ClockDevice {
     return `${line.slice(0, 6)}${String.fromCharCode(tens)}${line.slice(7)}`;
   }
 
-  reset(): void {
+  reset(options: { retainCounter?: boolean } = {}): void {
     this.displayTimingReadCount = 0;
-    this.counter = ClockDevice.COUNTER_MODULUS - 1;
-    this.cycleRemainder = 0;
+    if (!options.retainCounter) {
+      this.counter = ClockDevice.COUNTER_MODULUS - 1;
+      this.cycleRemainder = 0;
+    }
     this.timeDigits.fill(0);
   }
 }
@@ -273,6 +278,8 @@ export class DisplayDevice {
   private portTouched = false;
   private brightness = 0;
   private blanked = false;
+  /** False while the ON/OFF switch has removed power from the terminal. */
+  powered = true;
   private inactiveCpuCycles = 0;
 
   constructor(private readonly clock: ClockDevice = new ClockDevice()) {
@@ -310,7 +317,7 @@ export class DisplayDevice {
   }
 
   displayLine(): string {
-    if (this.blanked) return " ".repeat(32);
+    if (this.blanked || !this.powered) return " ".repeat(32);
     if (!this.controller.isTouched()) return "UA-8295 READY?";
     const text = this.portTouched ? this.portLine() : this.textLine();
     if (text.trim().length > 0) return this.clock.restoreHourTens(text);
@@ -523,6 +530,121 @@ export class ModemRadioDevice {
   private defaultStatus(_address: number, busValue: number): number {
     // Unidentified IOP peripherals are pulled up until a workflow trace proves a register-specific status bit.
     return busValue & 0xff;
+  }
+}
+
+/**
+ * Piezo sounder on main P3.4. The ROM clicks it once per accepted key
+ * (0x0639) and, while a received message's sound alarm is pending, toggles it
+ * continuously from the key-wait loop (0x0648) until any key is pressed.
+ */
+export class BuzzerDevice {
+  static readonly TONE_WINDOW_CPU_CYCLES = ClockDevice.CPU_CYCLES_PER_SECOND / 10;
+  private level = 1;
+  private readonly recentToggles: number[] = [];
+  private toggles = 0;
+
+  observe(level: number, cycle: number): void {
+    const next = level ? 1 : 0;
+    if (next === this.level) return;
+    this.level = next;
+    this.toggles += 1;
+    this.recentToggles.push(cycle);
+    if (this.recentToggles.length > 16) this.recentToggles.shift();
+  }
+
+  /** A tone (rather than a single key click) is sounding at the given CPU cycle. */
+  isSounding(cycle: number): boolean {
+    const window = this.recentToggles.filter((toggle) => cycle - toggle <= BuzzerDevice.TONE_WINDOW_CPU_CYCLES);
+    return window.length >= 4;
+  }
+
+  toggleCount(): number {
+    return this.toggles;
+  }
+
+  reset(): void {
+    this.level = 1;
+    this.recentToggles.length = 0;
+    this.toggles = 0;
+  }
+}
+
+export type ChargeMode = "off" | "normal" | "quick" | "fast";
+
+/**
+ * Battery charger control (manual Section 3, paragraph 2.2). The SHIFT+C
+ * routine at main code 0x04B3 drives active-low P1.0-P1.2: all three low for
+ * normal charging, P1.1 released for quick charging and P1.2 released for fast
+ * charging. Quick and fast charging also arm a 16-bit SRAM down-counter that
+ * the INT0 handler at 0x0493 decrements; when it expires the ROM releases all
+ * three lines. INT0 is supplied by the charger's timer while charge current
+ * flows. Its period is not documented, so the model uses one pulse per second
+ * (quick: 6,912 pulses, fast: 512 pulses with the original ROM constants).
+ */
+export class ChargerDevice {
+  static readonly TIMER_PULSE_CPU_CYCLES = ClockDevice.CPU_CYCLES_PER_SECOND;
+
+  /** External 10-30 V DC supply on the power connector. */
+  externalSupply = false;
+  /**
+   * NiCd pack condition, set by the operator. A low pack lights BATTERY LOW;
+   * a flat pack cannot power the terminal without the external supply
+   * (manual Section 3, paragraph 3.1). Charging chemistry is not modeled.
+   */
+  battery: "charged" | "low" | "flat" = "charged";
+
+  canPowerTerminal(): boolean {
+    return this.battery !== "flat" || this.externalSupply;
+  }
+  private lines = 0x07;
+  private cycleRemainder = 0;
+  private pulses = 0;
+
+  observePort1(value: number): void {
+    this.lines = value & 0x07;
+  }
+
+  mode(): ChargeMode {
+    switch (this.lines) {
+      case 0x00:
+        return "normal";
+      case 0x02:
+        return "quick";
+      case 0x04:
+        return "fast";
+      default:
+        return "off";
+    }
+  }
+
+  /** The BATTERY CHARGE indicator follows the charge current. */
+  isCharging(): boolean {
+    return this.externalSupply && this.mode() !== "off";
+  }
+
+  timerPulses(): number {
+    return this.pulses;
+  }
+
+  /** Returns how many charge-timer pulses fell due in the elapsed CPU cycles. */
+  advanceCpuCycles(cycles: number): number {
+    if (cycles <= 0 || !this.isCharging()) {
+      this.cycleRemainder = 0;
+      return 0;
+    }
+    this.cycleRemainder += cycles;
+    const due = Math.floor(this.cycleRemainder / ChargerDevice.TIMER_PULSE_CPU_CYCLES);
+    this.cycleRemainder -= due * ChargerDevice.TIMER_PULSE_CPU_CYCLES;
+    this.pulses += due;
+    return due;
+  }
+
+  reset(): void {
+    // Port pins float high on reset; the external supply is not part of the terminal.
+    this.lines = 0x07;
+    this.cycleRemainder = 0;
+    this.pulses = 0;
   }
 }
 
@@ -757,6 +879,10 @@ export class UA8295Hardware implements CpuHardwareHooks {
   readonly modemRadio = new ModemRadioDevice();
   readonly storage = new StorageControlDevice();
   readonly keyboardScan = new KeyboardScanController();
+  readonly charger = new ChargerDevice();
+  readonly buzzer = new BuzzerDevice();
+  readonly printer = new SerialPeripheral("printer");
+  readonly computer = new SerialPeripheral("computer");
   private mainCpu: MCS51 | undefined;
   private hardwareKey: FrontPanelKey | null = null;
 
@@ -768,11 +894,15 @@ export class UA8295Hardware implements CpuHardwareHooks {
   service(): void {
     this.serial.service();
     this.updateKeyboardScan();
+    const cycle = this.mainCpu?.cycles ?? 0;
+    this.printer.advanceTo(cycle);
+    this.computer.advanceTo(cycle);
   }
 
   advanceCpuCycles(cycles: number): void {
     this.clock.advanceCpuCycles(cycles);
     this.display.advanceCpuCycles(cycles);
+    if (this.charger.advanceCpuCycles(cycles) > 0) this.mainCpu?.requestInterrupt("EX0");
   }
 
   /** Deterministic wall-clock hook used by manual scenarios and operators. */
@@ -780,18 +910,39 @@ export class UA8295Hardware implements CpuHardwareHooks {
     const duration = Math.max(0, seconds);
     this.clock.advanceSeconds(duration);
     this.display.advanceCpuCycles(duration * ClockDevice.CPU_CYCLES_PER_SECOND);
+    if (this.charger.advanceCpuCycles(duration * ClockDevice.CPU_CYCLES_PER_SECOND) > 0) {
+      this.mainCpu?.requestInterrupt("EX0");
+    }
   }
 
-  reset(): void {
+  /**
+   * Power-on reset. The battery-backed real-time counter keeps running across
+   * an ON/OFF cycle; a full reset also restarts it.
+   */
+  reset(options: { retainClock?: boolean } = {}): void {
     this.keyboard.clear();
     this.keyboardScan.reset();
-    this.clock.reset();
+    this.clock.reset({ retainCounter: options.retainClock });
     this.display.reset();
     this.modemRadio.reset();
+    this.charger.reset();
+    this.buzzer.reset();
+    this.printer.reset();
+    this.computer.reset();
     this.hardwareKey = null;
   }
 
   readSfr(cpu: CpuName, address: number, latchValue: number): number {
+    if (cpu === "main" && address === 0x90) {
+      // Quasi-bidirectional pins: an external device can only pull a
+      // released (latched-high) pin low.
+      const cycle = this.mainCpu?.cycles ?? 0;
+      let pins = latchValue & 0xff;
+      if (!this.computer.terminalRxLevel(cycle)) pins &= ~0x10;
+      if (!this.printer.busy) pins &= ~0x20;
+      if (!this.printer.terminalRxLevel(cycle)) pins &= ~0x80;
+      return pins;
+    }
     if (address === 0xb0) {
       if (cpu === "iop") return this.modemRadio.readPort3(latchValue);
       const base = this.keyboard.readP3(latchValue, { forceReadyLow: cpu === "main" });
@@ -804,6 +955,15 @@ export class UA8295Hardware implements CpuHardwareHooks {
   writeSfr(cpu: CpuName, address: number, value: number): void {
     if (cpu === "iop" && address === 0xb0) {
       this.modemRadio.observePort3(value);
+    }
+    if (cpu === "main" && address === 0xb0) {
+      this.buzzer.observe((value >> 4) & 1, this.mainCpu?.cycles ?? 0);
+    }
+    if (cpu === "main" && address === 0x90) {
+      const cycle = this.mainCpu?.cycles ?? 0;
+      this.charger.observePort1(value);
+      this.computer.observeTerminalTx((value >> 3) & 1, cycle);
+      this.printer.observeTerminalTx((value >> 6) & 1, cycle);
     }
     // The IOP no longer scans the keyboard via P1 row-select; the dedicated
     // controller chip drives 0x8400 + P3.3 directly, so there is nothing to do

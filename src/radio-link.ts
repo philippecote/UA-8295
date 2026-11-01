@@ -18,8 +18,21 @@ export interface RadioDeliveryStats {
  * decryption and message storage. Simultaneous transmission drops carrier and
  * recovered bytes at both receivers.
  */
+export interface ChannelNoise {
+  /** XOR masks applied to recovered payload bytes, keyed by index within each packet. */
+  leftToRight: Map<number, number>;
+  rightToLeft: Map<number, number>;
+}
+
 export class UA8295RadioLink {
   collision = false;
+  /** False models a broken radio path: no carrier and no recovered octets reach either side. */
+  connected = true;
+  /**
+   * Bit errors introduced by the radio channel. The receiving main ROM's BCH
+   * decoder corrects or flags them (manual Section 1, paragraph 1.6).
+   */
+  readonly noise: ChannelNoise = { leftToRight: new Map(), rightToLeft: new Map() };
   private leftSerialCursor = 0;
   private rightSerialCursor = 0;
   private leftProtocolTxActive = false;
@@ -50,8 +63,9 @@ export class UA8295RadioLink {
     // terminator that is a valid turnaround, not a collision. Raw simultaneous
     // port-keying (used by the hardware-level model) remains a collision.
     this.collision = leftTx && rightTx && (simultaneousProtocolStart || directPortOverlap);
-    leftRadio.setInput(rightTx && !this.collision, rightRadio.transmitMark());
-    rightRadio.setInput(leftTx && !this.collision, leftRadio.transmitMark());
+    const path = this.connected && !this.collision;
+    leftRadio.setInput(rightTx && path, rightRadio.transmitMark());
+    rightRadio.setInput(leftTx && path, leftRadio.transmitMark());
     this.bridgeRecoveredBytes(this.left, this.right, "left");
     this.bridgeRecoveredBytes(this.right, this.left, "right");
   }
@@ -78,7 +92,7 @@ export class UA8295RadioLink {
       if (startsPacket) {
         active = true;
         payloadBytes = 0;
-        if (!this.collision) {
+        if (!this.collision && this.connected) {
           peer.mainCpu.receiveSerial(0x40, true);
           if (side === "left") this.leftDeliveredPackets += 1;
           else this.rightDeliveredPackets += 1;
@@ -91,12 +105,13 @@ export class UA8295RadioLink {
         // 0xFF is the modem packet terminator, not part of the recovered
         // encrypted payload presented to the peer main CPU.
         active = false;
-      } else if (active && transfer.source === "main" && !transfer.rb8 && !this.collision) {
+      } else if (active && transfer.source === "main" && !transfer.rb8 && !this.collision && this.connected) {
         // The demodulator returns the encrypted over-the-air octets unchanged;
         // forward that recovered byte into the peer's existing main/IOP serial
         // receive path. Framing, checksum, decryption, address filtering and
         // message storage remain original main-ROM behavior.
-        peer.mainCpu.receiveSerial(transfer.value, false);
+        const noise = (side === "left" ? this.noise.leftToRight : this.noise.rightToLeft).get(payloadBytes) ?? 0;
+        peer.mainCpu.receiveSerial(transfer.value ^ noise, false);
         payloadBytes += 1;
         if (side === "left") this.leftDeliveredPayloadBytes += 1;
         else this.rightDeliveredPayloadBytes += 1;
@@ -114,6 +129,7 @@ export class UA8295RadioLink {
   }
 
   status(): string {
+    if (!this.connected) return "disconnected";
     if (this.collision) return "collision";
     if (this.left.hardware.modemRadio.isTransmitting()) return "terminal A transmitting";
     if (this.right.hardware.modemRadio.isTransmitting()) return "terminal B transmitting";
